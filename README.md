@@ -20,7 +20,8 @@ The approach trains lightweight linear probes on attention head activations to d
 ## Requirements
 
 - CUDA GPU (models load in 4-bit NF4 quantization via `bitsandbytes`)
-- Python packages: `torch`, `transformers`, `pyvene`, `scikit-learn`, `numpy`, `matplotlib`
+- Python packages: `torch`, `transformers`, `pyvene`, `peft`, `scikit-learn`, `numpy`, `matplotlib`
+- Pass `--no-quantize` to any subcommand to load models in full precision instead
 
 ---
 
@@ -110,6 +111,32 @@ All subcommands accept `--help` for full option listings.
 
 ---
 
+### LoRA comparison (`LoRA` branch)
+
+The `LoRA` branch adds a parallel intervention approach: train a LoRA adapter on context-aligned data, compute the per-head activation delta between the LoRA and base model, then use that delta as the ITI direction instead of the probe classifier direction.
+
+```bash
+# Train LoRA adapter on context-aligned examples
+python head_probing.py lora-train --dataset pop_qa --dataset-size 10000 --num-epochs 3
+
+# Compute per-head delta: mean(LoRA activations) − mean(base activations)
+# Reuses activations.pkl from a prior `collect` run
+python head_probing.py lora-delta --activations activations.pkl
+
+# Create ITI models using delta directions
+python head_probing.py lora-intervene --ks 16 32 64 --alphas 5 10
+
+# Cosine similarity heatmap: how aligned are probe directions and LoRA deltas?
+python head_probing.py similarity --probes probes.pkl --delta lora_delta.pkl \
+    --accuracies accuracies_meta-llama_Meta-Llama-3-8B-Instruct.txt
+
+# Side-by-side evaluation: base / probe-ITI / LoRA-delta-ITI / full-LoRA
+python head_probing.py compare --dataset pop_qa --num-tests 50 --ks 16 32 --alphas 5 \
+    --lora-adapter lora_adapter
+```
+
+---
+
 ## Output files
 
 | File | Description |
@@ -118,7 +145,10 @@ All subcommands accept `--help` for full option listings.
 | `probes.pkl` | Trained probes — nested list `[layer][head]` of `LogisticRegression` |
 | `corr_preds.pkl` | Correct prediction counts per head `[layers, heads]` |
 | `accuracies_<model>.txt` | Probe accuracy matrix (space-separated, one row per layer) |
-| `updated_models/<model>_top_<k>_alpha_<alpha>_context/` | Saved intervened model |
+| `updated_models/<model>_top_<k>_alpha_<alpha>_context/` | Saved probe-ITI model |
+| `lora_adapter/` | Saved LoRA adapter weights |
+| `lora_delta.pkl` | Per-head activation delta `[layers, heads, head_dim]` |
+| `updated_models_lora/<model>_top_<k>_alpha_<alpha>_lora_delta/` | Saved LoRA-delta-ITI model |
 
 ---
 
