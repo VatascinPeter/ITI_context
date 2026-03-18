@@ -8,6 +8,7 @@ import pyvene as pv
 import re
 import csv
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import numpy as np
 import random
 import torch as ch
@@ -590,6 +591,240 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
 
 
 # ---------------------------------------------------------------------------
+# LoRA training and activation delta
+# ---------------------------------------------------------------------------
+
+def get_lora_model(model_name="meta-llama/Meta-Llama-3-8B-Instruct", r=16, lora_alpha=32, quantize=True):
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=ch.bfloat16
+    ) if quantize else None
+    model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager",
+                                                  quantization_config=bnb_config, device_map="cuda")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if quantize:
+        model = prepare_model_for_kbit_training(model)
+    lora_config = LoraConfig(
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    return model, tokenizer
+
+
+def train_lora(model, tokenizer, dataset, output_dir, num_epochs=3, lr=1e-4):
+    """Fine-tune LoRA on label=1 (context-aligned) examples only."""
+    aligned = [d for d in dataset if d['label'] == 1]
+    optimizer = ch.optim.AdamW(model.parameters(), lr=lr)
+    model.train()
+    dataset_len = len(aligned)
+    print(f"LoRA training on {dataset_len} context-aligned examples for {num_epochs} epoch(s).")
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        for i, data in enumerate(aligned):
+            full_text = data['query']
+            # Split at last occurrence of the response separator to find prefix
+            # Format is: {context}\n\n{query}\n\n{response}\n
+            # We split on the second-to-last '\n\n' to isolate the response
+            parts = full_text.split('\n\n')
+            prefix = '\n\n'.join(parts[:-1]) + '\n\n'
+
+            full_ids = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=1024).input_ids.to("cuda")
+            prefix_len = tokenizer(prefix, return_tensors="pt", truncation=True, max_length=1024).input_ids.shape[1]
+
+            labels = full_ids.clone()
+            labels[0, :prefix_len] = -100  # mask context+query tokens
+
+            outputs = model(input_ids=full_ids, labels=labels)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+
+            if (i + 1) % max(1, dataset_len // 10) == 0:
+                print(f"  Epoch {epoch+1}/{num_epochs} — {i+1}/{dataset_len} — loss: {total_loss / (i+1):.4f}")
+
+        print(f"Epoch {epoch+1} complete — avg loss: {total_loss / dataset_len:.4f}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    model.save_pretrained(output_dir)
+    print(f"LoRA adapter saved to {output_dir}")
+
+
+def get_lora_activation_delta(base_activations, lora_model, tokenizer, dataset, pv_configs):
+    """Collect activations from LoRA model and return mean delta over base activations."""
+    lora_activations, _ = get_activations_dataset(lora_model, tokenizer, dataset, pv_configs)
+    # delta shape: (num_layers, num_heads, head_dim)
+    delta = lora_activations.mean(axis=0) - base_activations.mean(axis=0)
+    return delta
+
+
+def model_intervention_from_delta(model, model_name, delta, base_activations, k, alpha, output_dir="updated_models_lora"):
+    """Apply LoRA activation delta directions as ITI biases, mirroring model_intervention."""
+    num_layers, num_heads, _ = delta.shape
+    delta_norms = np.linalg.norm(delta, axis=-1)  # (num_layers, num_heads)
+    top_heads = get_top_k_heads(delta_norms, k)
+
+    interventions = {}
+    for layer, _ in top_heads:
+        interventions[str(layer)] = []
+    for layer, head in top_heads:
+        direction = delta[layer][head]
+        direction = direction / np.linalg.norm(direction)
+        act_std = np.std(base_activations[:, layer, head, :] @ direction)
+        interventions[str(layer)].append((head, direction, act_std))
+
+    for layer_str, inters in interventions.items():
+        layer = int(layer_str)
+        displacement = np.zeros((num_heads, int(model.config.hidden_size / num_heads)))
+        for head, direction, act_std in inters:
+            displacement[head] = alpha * act_std * direction
+        displacement = ch.tensor(displacement.flatten(), device='cuda')
+        new_bias = displacement.to(ch.float16)
+        model.model.layers[layer].self_attn.o_proj.bias = ch.nn.Parameter(new_bias)
+
+    save_folder = f"{output_dir}/{model_name.replace(r'/', '_')}_top_{k}_alpha_{alpha}_lora_delta"
+    if os.path.exists(save_folder):
+        shutil.rmtree(save_folder)
+    os.makedirs(save_folder)
+    model.config.attention_bias = True
+    model.save_pretrained(save_folder, safe_serialization=False, max_shard_size="10GB")
+    print(f"Saved LoRA-delta intervened model to {save_folder}")
+
+
+def plot_cosine_similarity(probes, delta, accuracies_path=None):
+    """Plot per-head cosine similarity between probe directions and LoRA activation delta."""
+    num_layers = len(probes)
+    num_heads = len(probes[0])
+    cos_sim = np.zeros((num_layers, num_heads))
+    for i in range(num_layers):
+        for j in range(num_heads):
+            coef = probes[i][j].coef_.squeeze()
+            d = delta[i][j]
+            denom = np.linalg.norm(coef) * np.linalg.norm(d)
+            cos_sim[i][j] = np.dot(coef, d) / denom if denom > 0 else 0.0
+
+    plt.imshow(cos_sim, origin='lower', cmap='RdBu', vmin=-1, vmax=1)
+    plt.colorbar()
+    plt.xlabel("Heads")
+    plt.ylabel("Layers")
+    plt.title("Cosine similarity: probe direction vs LoRA activation delta")
+    plt.show()
+
+    if accuracies_path:
+        acc = []
+        with open(accuracies_path, "r") as f:
+            for line in f:
+                acc.append(list(map(float, line.split())))
+        acc = np.array(acc)
+        print(f"Correlation between probe accuracy and |cos_sim|: "
+              f"{np.corrcoef(acc.flatten(), np.abs(cos_sim).flatten())[0, 1]:.4f}")
+
+    print(f"Mean |cos_sim|: {np.abs(cos_sim).mean():.4f}")
+    print(f"Max  |cos_sim|: {np.abs(cos_sim).max():.4f}")
+    return cos_sim
+
+
+# ---------------------------------------------------------------------------
+# LoRA pipeline runners
+# ---------------------------------------------------------------------------
+
+def run_lora_train(model_name, dataset_name, dataset_size, output_dir="lora_adapter",
+                   num_epochs=3, lr=1e-4, quantize=True):
+    dataset, _ = get_dataset(dataset_name, dataset_size)
+    model, tokenizer = get_lora_model(model_name, quantize=quantize)
+    train_lora(model, tokenizer, dataset, output_dir, num_epochs=num_epochs, lr=lr)
+
+
+def run_lora_delta(model_name, dataset_name, dataset_size, lora_adapter_dir,
+                   base_activations_path, output_dir=".", quantize=True):
+    """Compute and save the per-head activation delta (LoRA mean − base mean)."""
+    dataset, _ = get_dataset(dataset_name, dataset_size)
+
+    with open(base_activations_path, "rb") as f:
+        base_activations = pickle.load(f)
+
+    # Load LoRA-merged model for activation collection
+    from peft import PeftModel
+    base_model = get_model_only(model_name, quantize=quantize)
+    lora_model = PeftModel.from_pretrained(base_model, lora_adapter_dir)
+    lora_model = lora_model.merge_and_unload()
+    _, tokenizer = get_model(model_name, quantize=quantize)
+
+    pv_configs = get_pv_configs(lora_model)
+    delta = get_lora_activation_delta(base_activations, lora_model, tokenizer, dataset, pv_configs)
+    save_pickle(delta, os.path.join(output_dir, "lora_delta"))
+    print(f"Delta saved to {os.path.join(output_dir, 'lora_delta.pkl')} — shape: {delta.shape}")
+    return delta
+
+
+def run_lora_intervene(model_name, delta_path, base_activations_path, ks, alphas,
+                       output_dir="updated_models_lora", quantize=True):
+    """Create ITI models using LoRA delta directions."""
+    with open(delta_path, "rb") as f:
+        delta = pickle.load(f)
+    with open(base_activations_path, "rb") as f:
+        base_activations = pickle.load(f)
+
+    for k in ks:
+        for alpha in alphas:
+            model = get_model_only(model_name, quantize=quantize)
+            model_intervention_from_delta(model, model_name, delta, base_activations,
+                                          k=k, alpha=alpha, output_dir=output_dir)
+            del model
+
+
+def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
+                probe_models_dir="updated_models", lora_delta_models_dir="updated_models_lora",
+                lora_adapter_dir=None, quantize=True):
+    """Evaluate and compare: base / probe-ITI / LoRA-delta-ITI / full LoRA."""
+    model, tokenizer = get_model(model_name, quantize=quantize)
+
+    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests, quantize=quantize)
+    model.to('cpu')
+    print(f"{'Base model':<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
+
+    for k in ks:
+        for alpha in alphas:
+            probe_variant = f"{probe_models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_context"
+            if os.path.exists(probe_variant):
+                m = AutoModelForCausalLM.from_pretrained(probe_variant, device_map="cuda")
+                ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize)
+                m.to('cpu')
+                print(f"{'Probe-ITI k='+str(k)+' α='+str(alpha):<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
+            else:
+                print(f"Probe-ITI k={k} α={alpha}: not found, skipping")
+
+            delta_variant = f"{lora_delta_models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_lora_delta"
+            if os.path.exists(delta_variant):
+                m = AutoModelForCausalLM.from_pretrained(delta_variant, device_map="cuda")
+                ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize)
+                m.to('cpu')
+                print(f"{'LoRA-delta-ITI k='+str(k)+' α='+str(alpha):<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
+            else:
+                print(f"LoRA-delta-ITI k={k} α={alpha}: not found, skipping")
+
+    if lora_adapter_dir and os.path.exists(lora_adapter_dir):
+        from peft import PeftModel
+        base_model = get_model_only(model_name, quantize=quantize)
+        lora_model = PeftModel.from_pretrained(base_model, lora_adapter_dir)
+        lora_model = lora_model.merge_and_unload()
+        ti, t, i = context_test(lora_model, tokenizer, dataset_name, num_tests, quantize=quantize)
+        lora_model.to('cpu')
+        print(f"{'Full LoRA':<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -672,6 +907,56 @@ def build_parser():
     p.add_argument("--model", default="", help="Model name label for the plot title")
     p.add_argument("--overlap", default=None, metavar="TRUTH_ACC", help="Also plot overlap with this truth accuracies file")
 
+    # --- lora-train ---
+    p = subparsers.add_parser("lora-train", help="Train a LoRA adapter on context-aligned examples and save it.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-size", type=int, default=10000)
+    p.add_argument("--output-dir", default="lora_adapter", help="Directory to save the LoRA adapter")
+    p.add_argument("--num-epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    p.add_argument("--lora-r", type=int, default=16, dest="lora_r", help="LoRA rank")
+    p.add_argument("--lora-alpha", type=int, default=32, dest="lora_alpha_val", help="LoRA alpha")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- lora-delta ---
+    p = subparsers.add_parser("lora-delta", help="Compute and save per-head activation delta (LoRA mean − base mean).")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-size", type=int, default=10000)
+    p.add_argument("--lora-adapter", default="lora_adapter", help="Path to saved LoRA adapter directory")
+    p.add_argument("--activations", default="activations.pkl", help="Path to saved base activations pickle")
+    p.add_argument("--output-dir", default=".", help="Directory to save lora_delta.pkl")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- lora-intervene ---
+    p = subparsers.add_parser("lora-intervene", help="Create ITI models using LoRA activation delta directions.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--delta", default="lora_delta.pkl", help="Path to saved delta pickle")
+    p.add_argument("--activations", default="activations.pkl", help="Path to saved base activations pickle")
+    p.add_argument("--ks", **ks_kwargs)
+    p.add_argument("--alphas", **alphas_kwargs)
+    p.add_argument("--output-dir", default="updated_models_lora")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- similarity ---
+    p = subparsers.add_parser("similarity", help="Plot cosine similarity between probe directions and LoRA delta.")
+    p.add_argument("--probes", default="probes.pkl", help="Path to saved probes pickle")
+    p.add_argument("--delta", default="lora_delta.pkl", help="Path to saved delta pickle")
+    p.add_argument("--accuracies", default=None, help="Path to accuracies .txt file for correlation report")
+
+    # --- compare ---
+    p = subparsers.add_parser("compare", help="Evaluate base / probe-ITI / LoRA-delta-ITI / full-LoRA side by side.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--num-tests", type=int, default=50)
+    p.add_argument("--ks", **ks_kwargs)
+    p.add_argument("--alphas", **alphas_kwargs)
+    p.add_argument("--probe-models-dir", default="updated_models")
+    p.add_argument("--lora-delta-models-dir", default="updated_models_lora")
+    p.add_argument("--lora-adapter", default=None, help="Path to LoRA adapter for full-LoRA evaluation (optional)")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
     return parser
 
 
@@ -711,6 +996,30 @@ def main():
         plot_accuracies(acc, 1.0, model_name=args.model, context_probes=(args.probe_type == "context"))
         if args.overlap:
             get_high_accuracy_heads_plot(args.overlap, args.accuracies)
+
+    elif args.mode == "lora-train":
+        run_lora_train(args.model, args.dataset, args.dataset_size, args.output_dir,
+                       num_epochs=args.num_epochs, lr=args.lr, quantize=quantize)
+
+    elif args.mode == "lora-delta":
+        run_lora_delta(args.model, args.dataset, args.dataset_size, args.lora_adapter,
+                       args.activations, args.output_dir, quantize=quantize)
+
+    elif args.mode == "lora-intervene":
+        run_lora_intervene(args.model, args.delta, args.activations,
+                           args.ks, args.alphas, args.output_dir, quantize=quantize)
+
+    elif args.mode == "similarity":
+        with open(args.probes, "rb") as f:
+            probes = pickle.load(f)
+        with open(args.delta, "rb") as f:
+            delta = pickle.load(f)
+        plot_cosine_similarity(probes, delta, accuracies_path=args.accuracies)
+
+    elif args.mode == "compare":
+        run_compare(args.model, args.dataset, args.ks, args.alphas, args.num_tests,
+                    args.probe_models_dir, args.lora_delta_models_dir,
+                    args.lora_adapter, quantize=quantize)
 
 
 if __name__ == "__main__":
