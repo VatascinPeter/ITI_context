@@ -103,25 +103,25 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False):
 # Model loading
 # ---------------------------------------------------------------------------
 
-def get_model(model_name="huggyllama/llama-7b"):
+def get_model(model_name="huggyllama/llama-7b", quantize=True):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=ch.bfloat16
-    )
+    ) if quantize else None
     model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", quantization_config=bnb_config, device_map="cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     return model, tokenizer
 
 
-def get_model_only(model_name="huggyllama/llama-7b"):
+def get_model_only(model_name="huggyllama/llama-7b", quantize=True):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=ch.bfloat16
-    )
+    ) if quantize else None
     model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager",
                                                  quantization_config=bnb_config, device_map="cuda")
     return model
@@ -403,7 +403,7 @@ def generate_answer_context_rating(model, tokenizer, dataset, probes_path, accur
 # Evaluation on trained models
 # ---------------------------------------------------------------------------
 
-def truth_test(model, tokenizer, dataset_path, num_tests=10):
+def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True):
     start = time.time()
     true_c = 0
     info_c = 0
@@ -423,7 +423,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10):
             answers.append(f"Question: {row['Question']}\nCorrect answer: {row['Best Answer']}\nGenerated response: {response}")
 
     model.to('cpu')
-    judge_model, judge_tokenizer = get_model("meta-llama/Meta-Llama-3-8B-Instruct")
+    judge_model, judge_tokenizer = get_model("meta-llama/Meta-Llama-3-8B-Instruct", quantize=quantize)
     for answer in answers:
         true = False
         informative = False
@@ -450,7 +450,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10):
     return true_informative / num_tests, true_c / num_tests, info_c / num_tests
 
 
-def context_test(model, tokenizer, dataset_name, num_tests=10):
+def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True):
     start = time.time()
     cont_c = 0
     info_c = 0
@@ -469,7 +469,7 @@ def context_test(model, tokenizer, dataset_name, num_tests=10):
         answers.append(f"Context: {row['context']}\nQuestion: {row['query']}\nGenerated Response: {response}\nContext-aligned Response: {row['corr_answer']}")
 
     model.to('cpu')
-    judge_model, judge_tokenizer = get_model("meta-llama/Meta-Llama-3-8B-Instruct")
+    judge_model, judge_tokenizer = get_model("meta-llama/Meta-Llama-3-8B-Instruct", quantize=quantize)
     for answer in answers:
         contextual = False
         informative = False
@@ -505,10 +505,10 @@ def save_pickle(data, name):
         pickle.dump(data, f)
 
 
-def run_collect(model_name, dataset_name, dataset_size, output_dir="."):
+def run_collect(model_name, dataset_name, dataset_size, output_dir=".", quantize=True):
     """Collect activations and train/evaluate probes. Saves activations, probes, and accuracy files."""
     dataset, dataset_no_answers = get_dataset(dataset_name, dataset_size)
-    model, tokenizer = get_model(model_name)
+    model, tokenizer = get_model(model_name, quantize=quantize)
     generation_test(model, tokenizer, dataset_no_answers, num_tests=5, chat_llm=True)
     pv_configs = get_pv_configs(model)
     activations, labels = get_activations_dataset(model, tokenizer, dataset, pv_configs)
@@ -521,7 +521,7 @@ def run_collect(model_name, dataset_name, dataset_size, output_dir="."):
     return activations, probes, corr_preds, num_cases
 
 
-def run_intervene(model_name, activations_path, probes_path, accuracies_path, ks, alphas, output_dir="updated_models"):
+def run_intervene(model_name, activations_path, probes_path, accuracies_path, ks, alphas, output_dir="updated_models", quantize=True):
     """Apply ITI to an existing model using pre-computed probes."""
     with open(activations_path, "rb") as f:
         activations = pickle.load(f)
@@ -535,25 +535,25 @@ def run_intervene(model_name, activations_path, probes_path, accuracies_path, ks
 
     for k in ks:
         for alpha in alphas:
-            model = get_model_only(model_name)
+            model = get_model_only(model_name, quantize=quantize)
             model_intervention(model, model_name, probes, activations, accuracies, k=k, alpha=alpha, output_dir=output_dir)
             del model
 
 
-def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_dir="updated_models"):
+def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_dir="updated_models", quantize=True):
     """Full pipeline: collect activations, train probes, and create all intervened models."""
-    activations, probes, corr_preds, _ = run_collect(model_name, dataset_name, dataset_size)
+    activations, probes, corr_preds, _ = run_collect(model_name, dataset_name, dataset_size, quantize=quantize)
     for k in ks:
         for alpha in alphas:
-            model = get_model_only(model_name)
+            model = get_model_only(model_name, quantize=quantize)
             model_intervention(model, model_name, probes, activations, corr_preds, k=k, alpha=alpha, output_dir=output_dir)
             del model
 
 
-def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models"):
+def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models", quantize=True):
     """Evaluate context-following on the base model and all intervened variants."""
-    model, tokenizer = get_model(model_name)
-    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests)
+    model, tokenizer = get_model(model_name, quantize=quantize)
+    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests, quantize=quantize)
     model.to('cpu')
     print(f"Base model — context*informative: {ti:.3f}, context: {t:.3f}, informative: {i:.3f}")
 
@@ -564,16 +564,16 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
                 print(f"Skipping {variant} (not found)")
                 continue
             variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
-            ti, t, i = context_test(variant_model, tokenizer, dataset_name, num_tests)
+            ti, t, i = context_test(variant_model, tokenizer, dataset_name, num_tests, quantize=quantize)
             variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f}, context: {t:.3f}, informative: {i:.3f}")
 
 
 def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/updated_models",
-                   dataset_path="../TruthfulQA/TruthfulQA.csv"):
+                   dataset_path="../TruthfulQA/TruthfulQA.csv", quantize=True):
     """Evaluate truthfulness on the base model and all intervened variants."""
-    model, tokenizer = get_model(model_name)
-    ti, t, i = truth_test(model, tokenizer, dataset_path, num_tests)
+    model, tokenizer = get_model(model_name, quantize=quantize)
+    ti, t, i = truth_test(model, tokenizer, dataset_path, num_tests, quantize=quantize)
     model.to('cpu')
     print(f"Base model — true*informative: {ti:.3f}, true: {t:.3f}, informative: {i:.3f}")
 
@@ -584,7 +584,7 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
                 print(f"Skipping {variant} (not found)")
                 continue
             variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
-            ti, t, i = truth_test(variant_model, tokenizer, dataset_path, num_tests)
+            ti, t, i = truth_test(variant_model, tokenizer, dataset_path, num_tests, quantize=quantize)
             variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — true*informative: {ti:.3f}, true: {t:.3f}, informative: {i:.3f}")
 
@@ -605,6 +605,7 @@ def build_parser():
     dataset_kwargs = dict(choices=["ms_marco", "pop_qa", "truthQA"], default="pop_qa")
     ks_kwargs = dict(type=int, nargs="+", default=[16, 32, 48, 64, 80, 96], metavar="K", help="Top-k heads to intervene on")
     alphas_kwargs = dict(type=float, nargs="+", default=[2, 5, 7, 10], metavar="ALPHA", help="Intervention strength multipliers")
+    quantize_kwargs = dict(action="store_true", dest="no_quantize", help="Load model in full precision (no 4-bit quantization)")
 
     # --- train ---
     p = subparsers.add_parser("train", help="Full pipeline: collect activations, train probes, create ITI models.")
@@ -614,6 +615,7 @@ def build_parser():
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
     p.add_argument("--output-dir", default="updated_models", help="Directory to save ITI models")
+    p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- collect ---
     p = subparsers.add_parser("collect", help="Collect activations and train probes only (no model intervention).")
@@ -621,6 +623,7 @@ def build_parser():
     p.add_argument("--dataset", **dataset_kwargs)
     p.add_argument("--dataset-size", type=int, default=10000)
     p.add_argument("--output-dir", default=".", help="Directory to save activations/probes/accuracies")
+    p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- intervene ---
     p = subparsers.add_parser("intervene", help="Apply ITI to an existing model using saved probes.")
@@ -631,6 +634,7 @@ def build_parser():
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
     p.add_argument("--output-dir", default="updated_models")
+    p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- test-context ---
     p = subparsers.add_parser("test-context", help="Evaluate context-following on base + intervened models.")
@@ -640,6 +644,7 @@ def build_parser():
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
     p.add_argument("--models-dir", default="updated_models")
+    p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- test-truth ---
     p = subparsers.add_parser("test-truth", help="Evaluate truthfulness on base + intervened models.")
@@ -649,6 +654,7 @@ def build_parser():
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
     p.add_argument("--models-dir", default="Truth/updated_models")
+    p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- rate ---
     p = subparsers.add_parser("rate", help="Generate answers with per-token context-alignment ratings.")
@@ -657,6 +663,7 @@ def build_parser():
     p.add_argument("--probes", default="probes.pkl")
     p.add_argument("--accuracies", default=None, help="Path to accuracies .txt file (default: auto-detect)")
     p.add_argument("--top-k", type=int, default=16, help="Number of top probes to use for rating")
+    p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- plot ---
     p = subparsers.add_parser("plot", help="Plot probe accuracy heatmaps.")
@@ -672,25 +679,27 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    quantize = not args.no_quantize if hasattr(args, "no_quantize") else True
+
     if args.mode == "train":
-        run_train(args.model, args.dataset, args.ks, args.alphas, args.dataset_size, args.output_dir)
+        run_train(args.model, args.dataset, args.ks, args.alphas, args.dataset_size, args.output_dir, quantize=quantize)
 
     elif args.mode == "collect":
-        run_collect(args.model, args.dataset, args.dataset_size, args.output_dir)
+        run_collect(args.model, args.dataset, args.dataset_size, args.output_dir, quantize=quantize)
 
     elif args.mode == "intervene":
         acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
-        run_intervene(args.model, args.activations, args.probes, acc_path, args.ks, args.alphas, args.output_dir)
+        run_intervene(args.model, args.activations, args.probes, acc_path, args.ks, args.alphas, args.output_dir, quantize=quantize)
 
     elif args.mode == "test-context":
-        run_test_context(args.model, args.dataset, args.ks, args.alphas, args.num_tests, args.models_dir)
+        run_test_context(args.model, args.dataset, args.ks, args.alphas, args.num_tests, args.models_dir, quantize=quantize)
 
     elif args.mode == "test-truth":
-        run_test_truth(args.model, args.ks, args.alphas, args.num_tests, args.models_dir, args.dataset_path)
+        run_test_truth(args.model, args.ks, args.alphas, args.num_tests, args.models_dir, args.dataset_path, quantize=quantize)
 
     elif args.mode == "rate":
         acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
-        model, tokenizer = get_model(args.model)
+        model, tokenizer = get_model(args.model, quantize=quantize)
         generate_answer_context_rating(model, tokenizer, args.queries, args.probes, acc_path, top_k=args.top_k)
 
     elif args.mode == "plot":
