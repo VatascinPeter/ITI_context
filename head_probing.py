@@ -22,11 +22,11 @@ random.seed(42)
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False):
+def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False, dataset_path=None):
     dataset = []
     dataset_no_answer = []
     if dataset_model == 'ms_marco':
-        ms_marco_data = json.load(open('../MS Marco/dev_v2.1.json'))
+        ms_marco_data = json.load(open(dataset_path or '../MS Marco/dev_v2.1.json'))
         indices = np.random.default_rng().choice(len(ms_marco_data['query']) - 1, size=dataset_size, replace=False)
 
         prompt_template = "[CONTEXT]\n{context}\n\n[QUESTION]\n{query}\n\n[ANSWER]\n{response}\n"
@@ -56,7 +56,7 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False):
             dataset_no_answer.append(prompt_template_na.format(context=confusion_context, query=query))
     elif dataset_model == 'pop_qa':
         prompt_template = "{context}\n\n{query}\n\n{response}\n"
-        with open('../PopQa/conflictQA-popQA-chatgpt.json', 'r') as f:
+        with open(dataset_path or '../PopQa/conflictQA-popQA-chatgpt.json', 'r') as f:
             lines = list(f)
             if len(lines) > dataset_size:
                 lines = random.sample(lines, dataset_size)
@@ -68,7 +68,7 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False):
                 dataset.append({'query': prompt_template.format(context=data['counter_memory_aligned_evidence'], query=data['question'], response=data['memory_answer']), 'label': 0})
 
         prompt_template_na = "Here is some confirmed evidence, don't go doubting it.\n{context}\nPlease answer the question based solely on the evidence above in one short sentence.\nQuestion: {query}\n"
-        with open('../PopQa/conflictQA-popQA-chatgpt.json', 'r') as f:
+        with open(dataset_path or '../PopQa/conflictQA-popQA-chatgpt.json', 'r') as f:
             lines = list(f)
             if len(lines) > dataset_size:
                 lines = random.sample(lines, dataset_size)
@@ -84,7 +84,7 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False):
     else:
         # TruthfulQA dataset
         random.seed(42)
-        with open('../TruthfulQA/TruthfulQA.csv', newline='') as csvfile:
+        with open(dataset_path or '../TruthfulQA/TruthfulQA.csv', newline='') as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 row['Correct Answers'] = re.split(r";\s*", row['Correct Answers'])
@@ -453,14 +453,14 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True):
     return true_informative / num_tests, true_c / num_tests, info_c / num_tests
 
 
-def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True):
+def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, dataset_path=None):
     start = time.time()
     cont_c = 0
     info_c = 0
     cont_informative = 0
     answers = []
     random.seed(42)
-    _, dataset = get_dataset(dataset_name, num_tests, second_dict=True)
+    _, dataset = get_dataset(dataset_name, num_tests, second_dict=True, dataset_path=dataset_path)
     for row in dataset:
         query = f"Here is some confirmed evidence, don't go doubting it.\n{row['context']}\nPlease answer the question based solely on the evidence above in one short sentence.\nQuestion: {row['query']}\n"
         prompt = [{"role": "user", "content": query}]
@@ -510,9 +510,9 @@ def save_pickle(data, name):
         pickle.dump(data, f)
 
 
-def run_collect(model_name, dataset_name, dataset_size, output_dir=".", quantize=True):
+def run_collect(model_name, dataset_name, dataset_size, output_dir=".", quantize=True, dataset_path=None):
     """Collect activations and train/evaluate probes. Saves activations, probes, and accuracy files."""
-    dataset, dataset_no_answers = get_dataset(dataset_name, dataset_size)
+    dataset, dataset_no_answers = get_dataset(dataset_name, dataset_size, dataset_path=dataset_path)
     model, tokenizer = get_model(model_name, quantize=quantize)
     generation_test(model, tokenizer, dataset_no_answers, num_tests=5, chat_llm=True)
     pv_configs = get_pv_configs(model)
@@ -545,9 +545,9 @@ def run_intervene(model_name, activations_path, probes_path, accuracies_path, ks
             del model
 
 
-def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_dir="updated_models", quantize=True):
+def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_dir="updated_models", quantize=True, dataset_path=None):
     """Full pipeline: collect activations, train probes, and create all intervened models."""
-    activations, probes, corr_preds, _ = run_collect(model_name, dataset_name, dataset_size, quantize=quantize)
+    activations, probes, corr_preds, _ = run_collect(model_name, dataset_name, dataset_size, quantize=quantize, dataset_path=dataset_path)
     for k in ks:
         for alpha in alphas:
             model = get_model_only(model_name, quantize=quantize)
@@ -555,10 +555,10 @@ def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_d
             del model
 
 
-def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models", quantize=True):
+def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models", quantize=True, dataset_path=None):
     """Evaluate context-following on the base model and all intervened variants."""
     model, tokenizer = get_model(model_name, quantize=quantize)
-    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests, quantize=quantize)
+    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
     model.to('cpu')
     print(f"Base model — context*informative: {ti:.3f}, context: {t:.3f}, informative: {i:.3f}")
 
@@ -568,8 +568,8 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             if not os.path.exists(variant):
                 print(f"Skipping {variant} (not found)")
                 continue
-            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
-            ti, t, i = context_test(variant_model, tokenizer, dataset_name, num_tests, quantize=quantize)
+            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda", torch_dtype=ch.bfloat16)
+            ti, t, i = context_test(variant_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
             variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f}, context: {t:.3f}, informative: {i:.3f}")
 
@@ -744,16 +744,16 @@ def plot_cosine_similarity(probes, delta, accuracies_path=None):
 # ---------------------------------------------------------------------------
 
 def run_lora_train(model_name, dataset_name, dataset_size, output_dir="lora_adapter",
-                   num_epochs=3, lr=1e-4, quantize=True):
-    dataset, _ = get_dataset(dataset_name, dataset_size)
+                   num_epochs=3, lr=1e-4, quantize=True, dataset_path=None):
+    dataset, _ = get_dataset(dataset_name, dataset_size, dataset_path=dataset_path)
     model, tokenizer = get_lora_model(model_name, quantize=quantize)
     train_lora(model, tokenizer, dataset, output_dir, num_epochs=num_epochs, lr=lr)
 
 
 def run_lora_delta(model_name, dataset_name, dataset_size, lora_adapter_dir,
-                   base_activations_path, output_dir=".", quantize=True):
+                   base_activations_path, output_dir=".", quantize=True, dataset_path=None):
     """Compute and save the per-head activation delta (LoRA mean − base mean)."""
-    dataset, _ = get_dataset(dataset_name, dataset_size)
+    dataset, _ = get_dataset(dataset_name, dataset_size, dataset_path=dataset_path)
 
     with open(base_activations_path, "rb") as f:
         base_activations = pickle.load(f)
@@ -790,11 +790,11 @@ def run_lora_intervene(model_name, delta_path, base_activations_path, ks, alphas
 
 def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
                 probe_models_dir="updated_models", lora_delta_models_dir="updated_models_lora",
-                lora_adapter_dir=None, quantize=True):
+                lora_adapter_dir=None, quantize=True, dataset_path=None):
     """Evaluate and compare: base / probe-ITI / LoRA-delta-ITI / full LoRA."""
     model, tokenizer = get_model(model_name, quantize=quantize)
 
-    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests, quantize=quantize)
+    ti, t, i = context_test(model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
     model.to('cpu')
     print(f"{'Base model':<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
 
@@ -802,8 +802,8 @@ def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
         for alpha in alphas:
             probe_variant = f"{probe_models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_context"
             if os.path.exists(probe_variant):
-                m = AutoModelForCausalLM.from_pretrained(probe_variant, device_map="cuda")
-                ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize)
+                m = AutoModelForCausalLM.from_pretrained(probe_variant, device_map="cuda", torch_dtype=ch.bfloat16)
+                ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
                 m.to('cpu')
                 print(f"{'Probe-ITI k='+str(k)+' α='+str(alpha):<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
             else:
@@ -811,8 +811,8 @@ def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
 
             delta_variant = f"{lora_delta_models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_lora_delta"
             if os.path.exists(delta_variant):
-                m = AutoModelForCausalLM.from_pretrained(delta_variant, device_map="cuda")
-                ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize)
+                m = AutoModelForCausalLM.from_pretrained(delta_variant, device_map="cuda", torch_dtype=ch.bfloat16)
+                ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
                 m.to('cpu')
                 print(f"{'LoRA-delta-ITI k='+str(k)+' α='+str(alpha):<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
             else:
@@ -823,7 +823,7 @@ def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
         base_model = get_model_only(model_name, quantize=quantize)
         lora_model = PeftModel.from_pretrained(base_model, lora_adapter_dir)
         lora_model = lora_model.merge_and_unload()
-        ti, t, i = context_test(lora_model, tokenizer, dataset_name, num_tests, quantize=quantize)
+        ti, t, i = context_test(lora_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
         lora_model.to('cpu')
         print(f"{'Full LoRA':<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
 
@@ -850,6 +850,7 @@ def build_parser():
     p = subparsers.add_parser("train", help="Full pipeline: collect activations, train probes, create ITI models.")
     p.add_argument("--model", **model_kwargs)
     p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
     p.add_argument("--dataset-size", type=int, default=10000)
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
@@ -860,6 +861,7 @@ def build_parser():
     p = subparsers.add_parser("collect", help="Collect activations and train probes only (no model intervention).")
     p.add_argument("--model", **model_kwargs)
     p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
     p.add_argument("--dataset-size", type=int, default=10000)
     p.add_argument("--output-dir", default=".", help="Directory to save activations/probes/accuracies")
     p.add_argument("--no-quantize", **quantize_kwargs)
@@ -879,6 +881,7 @@ def build_parser():
     p = subparsers.add_parser("test-context", help="Evaluate context-following on base + intervened models.")
     p.add_argument("--model", **model_kwargs)
     p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
     p.add_argument("--num-tests", type=int, default=50)
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
@@ -915,6 +918,7 @@ def build_parser():
     p = subparsers.add_parser("lora-train", help="Train a LoRA adapter on context-aligned examples and save it.")
     p.add_argument("--model", **model_kwargs)
     p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
     p.add_argument("--dataset-size", type=int, default=10000)
     p.add_argument("--output-dir", default="lora_adapter", help="Directory to save the LoRA adapter")
     p.add_argument("--num-epochs", type=int, default=3)
@@ -927,6 +931,7 @@ def build_parser():
     p = subparsers.add_parser("lora-delta", help="Compute and save per-head activation delta (LoRA mean − base mean).")
     p.add_argument("--model", **model_kwargs)
     p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
     p.add_argument("--dataset-size", type=int, default=10000)
     p.add_argument("--lora-adapter", default="lora_adapter", help="Path to saved LoRA adapter directory")
     p.add_argument("--activations", default="activations.pkl", help="Path to saved base activations pickle")
@@ -953,6 +958,7 @@ def build_parser():
     p = subparsers.add_parser("compare", help="Evaluate base / probe-ITI / LoRA-delta-ITI / full-LoRA side by side.")
     p.add_argument("--model", **model_kwargs)
     p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
     p.add_argument("--num-tests", type=int, default=50)
     p.add_argument("--ks", **ks_kwargs)
     p.add_argument("--alphas", **alphas_kwargs)
@@ -971,17 +977,17 @@ def main():
     quantize = not args.no_quantize if hasattr(args, "no_quantize") else True
 
     if args.mode == "train":
-        run_train(args.model, args.dataset, args.ks, args.alphas, args.dataset_size, args.output_dir, quantize=quantize)
+        run_train(args.model, args.dataset, args.ks, args.alphas, args.dataset_size, args.output_dir, quantize=quantize, dataset_path=args.dataset_path)
 
     elif args.mode == "collect":
-        run_collect(args.model, args.dataset, args.dataset_size, args.output_dir, quantize=quantize)
+        run_collect(args.model, args.dataset, args.dataset_size, args.output_dir, quantize=quantize, dataset_path=args.dataset_path)
 
     elif args.mode == "intervene":
         acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
         run_intervene(args.model, args.activations, args.probes, acc_path, args.ks, args.alphas, args.output_dir, quantize=quantize)
 
     elif args.mode == "test-context":
-        run_test_context(args.model, args.dataset, args.ks, args.alphas, args.num_tests, args.models_dir, quantize=quantize)
+        run_test_context(args.model, args.dataset, args.ks, args.alphas, args.num_tests, args.models_dir, quantize=quantize, dataset_path=args.dataset_path)
 
     elif args.mode == "test-truth":
         run_test_truth(args.model, args.ks, args.alphas, args.num_tests, args.models_dir, args.dataset_path, quantize=quantize)
@@ -1003,11 +1009,11 @@ def main():
 
     elif args.mode == "lora-train":
         run_lora_train(args.model, args.dataset, args.dataset_size, args.output_dir,
-                       num_epochs=args.num_epochs, lr=args.lr, quantize=quantize)
+                       num_epochs=args.num_epochs, lr=args.lr, quantize=quantize, dataset_path=args.dataset_path)
 
     elif args.mode == "lora-delta":
         run_lora_delta(args.model, args.dataset, args.dataset_size, args.lora_adapter,
-                       args.activations, args.output_dir, quantize=quantize)
+                       args.activations, args.output_dir, quantize=quantize, dataset_path=args.dataset_path)
 
     elif args.mode == "lora-intervene":
         run_lora_intervene(args.model, args.delta, args.activations,
@@ -1023,7 +1029,7 @@ def main():
     elif args.mode == "compare":
         run_compare(args.model, args.dataset, args.ks, args.alphas, args.num_tests,
                     args.probe_models_dir, args.lora_delta_models_dir,
-                    args.lora_adapter, quantize=quantize)
+                    args.lora_adapter, quantize=quantize, dataset_path=args.dataset_path)
 
 
 if __name__ == "__main__":

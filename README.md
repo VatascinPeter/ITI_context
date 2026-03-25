@@ -27,13 +27,15 @@ The approach trains lightweight linear probes on attention head activations to d
 
 ## Datasets
 
-The following datasets are expected as siblings of this directory:
+The following datasets are expected by default as siblings of this directory:
 
-| Dataset | Path | Used for |
+| Dataset | Default path | Used for |
 |---|---|---|
 | MS MARCO | `../MS Marco/dev_v2.1.json` | Context-following probes |
 | ConflictQA-PopQA | `../PopQa/conflictQA-popQA-chatgpt.json` | Context vs. parametric memory |
 | TruthfulQA | `../TruthfulQA/TruthfulQA.csv` | Truthfulness probes |
+
+Pass `--dataset-path /your/path/to/file` to any subcommand that accepts `--dataset` (or `--dataset-path` for `test-truth`) to override the default location.
 
 ---
 
