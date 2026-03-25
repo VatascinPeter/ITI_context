@@ -447,6 +447,8 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True):
         if true and informative:
             true_informative += 1
 
+    del judge_model
+    ch.cuda.empty_cache()
     print(f"Truth test completed in {time.time() - start:.1f}s")
     return true_informative / num_tests, true_c / num_tests, info_c / num_tests
 
@@ -493,8 +495,10 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True):
         if contextual and informative:
             cont_informative += 1
 
+    del judge_model
+    ch.cuda.empty_cache()
     print(f"Context test completed in {time.time() - start:.1f}s")
-    return cont_informative / num_tests, cont_c / num_tests, info_c / num_tests
+    return cont_informative / len(dataset), cont_c / len(dataset), info_c / len(dataset)
 
 
 # ---------------------------------------------------------------------------
