@@ -56,7 +56,7 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False, 
             dataset_no_answer.append(prompt_template_na.format(context=confusion_context, query=query))
     elif dataset_model == 'pop_qa':
         prompt_template = "{context}\n\n{query}\n\n{response}\n"
-        with open(dataset_path or '../PopQa/conflictQA-popQA-chatgpt.json', 'r') as f:
+        with open(dataset_path or '../PopQA/conflictQA-popQA-chatgpt.json', 'r') as f:
             lines = list(f)
             if len(lines) > dataset_size:
                 lines = random.sample(lines, dataset_size)
@@ -68,7 +68,7 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False, 
                 dataset.append({'query': prompt_template.format(context=data['counter_memory_aligned_evidence'], query=data['question'], response=data['memory_answer']), 'label': 0})
 
         prompt_template_na = "Here is some confirmed evidence, don't go doubting it.\n{context}\nPlease answer the question based solely on the evidence above in one short sentence.\nQuestion: {query}\n"
-        with open(dataset_path or '../PopQa/conflictQA-popQA-chatgpt.json', 'r') as f:
+        with open(dataset_path or '../PopQA/conflictQA-popQA-chatgpt.json', 'r') as f:
             lines = list(f)
             if len(lines) > dataset_size:
                 lines = random.sample(lines, dataset_size)
@@ -160,7 +160,7 @@ def get_activations_dataset(model, tokenizer, dataset, pv_configs):
         x = ch.stack(collected_attn_w[0][1])
         x = x.squeeze()
         x = x.view(model.config.num_hidden_layers, model.config.num_attention_heads, np.shape(collected_attn_w[0][1][0].cpu())[-1] // model.config.num_attention_heads)
-        probing_dataset_X.append(x.cpu().numpy())
+        probing_dataset_X.append(x.cpu().float().numpy())
         probing_dataset_Y.append(data['label'])
 
         pct = int((i + 1) / dataset_len * 100)
@@ -568,7 +568,7 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             if not os.path.exists(variant):
                 print(f"Skipping {variant} (not found)")
                 continue
-            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda", torch_dtype=ch.bfloat16)
+            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
             ti, t, i = context_test(variant_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
             variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f}, context: {t:.3f}, informative: {i:.3f}")
@@ -802,7 +802,7 @@ def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
         for alpha in alphas:
             probe_variant = f"{probe_models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_context"
             if os.path.exists(probe_variant):
-                m = AutoModelForCausalLM.from_pretrained(probe_variant, device_map="cuda", torch_dtype=ch.bfloat16)
+                m = AutoModelForCausalLM.from_pretrained(probe_variant, device_map="cuda")
                 ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
                 m.to('cpu')
                 print(f"{'Probe-ITI k='+str(k)+' α='+str(alpha):<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
@@ -811,7 +811,7 @@ def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
 
             delta_variant = f"{lora_delta_models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_lora_delta"
             if os.path.exists(delta_variant):
-                m = AutoModelForCausalLM.from_pretrained(delta_variant, device_map="cuda", torch_dtype=ch.bfloat16)
+                m = AutoModelForCausalLM.from_pretrained(delta_variant, device_map="cuda")
                 ti, t, i = context_test(m, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path)
                 m.to('cpu')
                 print(f"{'LoRA-delta-ITI k='+str(k)+' α='+str(alpha):<45} ctx*info={ti:.3f}  ctx={t:.3f}  info={i:.3f}")
