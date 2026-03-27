@@ -28,10 +28,18 @@ python head_probing.py intervene --model meta-llama/Meta-Llama-3-8B-Instruct \
     --probes probes.pkl --activations activations.pkl --ks 32 64 --alphas 5 10
 
 # Evaluate context-following (base model + all saved variants)
-python head_probing.py test-context --dataset pop_qa --num-tests 50
+python head_probing.py test-context --dataset pop_qa --num-tests 1000
 
 # Evaluate truthfulness
-python head_probing.py test-truth --num-tests 100 --models-dir Truth/updated_models
+python head_probing.py test-truth --num-tests 1000 --models-dir Truth/updated_models
+
+# Prompt variant robustness check (3 judge prompt framings on a subset)
+python head_probing.py test-context --dataset pop_qa --num-tests 1000 \
+    --prompt-variant-check --variant-subset 100
+
+# Use a different judge model
+python head_probing.py test-context --dataset pop_qa --num-tests 1000 \
+    --judge-model mistralai/Mistral-7B-Instruct-v0.2
 
 # Per-token context-alignment ratings with colored terminal output
 python head_probing.py rate --queries "What is the capital of France?"
@@ -60,8 +68,10 @@ All subcommands support `--help` for full option listings.
 - `accuracies_<model_name>.txt` — accuracy matrix as space-separated floats (one row per layer)
 - `separators_<model_name>.pickle` — duplicate of probes (legacy, written by `lin_head_classifiers_test`)
 - `updated_models/<model>_top_<k>_alpha_<alpha>_context/` — saved intervened model weights
+- `results_context_<model>_<timestamp>.jsonl` — per-sample context evaluation log (prompt, response, judge prompt/raw/rationale/decision for each axis)
+- `results_truth_<model>_<timestamp>.jsonl` — per-sample truthfulness evaluation log (same schema)
 
-**Evaluation:** Both `truth_test` and `context_test` use a second copy of `meta-llama/Meta-Llama-3-8B-Instruct` as a judge LLM, scoring responses as truthful/contextual and informative independently. The reported metrics are: `true*informative` (both), `true`/`context` alone, and `informative` alone.
+**Evaluation:** Both `truth_test` and `context_test` load a judge LLM (default: `meta-llama/Meta-Llama-3-8B-Instruct`, overridable via `--judge-model`) at temperature 0 (greedy). The judge is prompted to produce a brief rationale then output `Answer: yes/no`; the response is parsed by `_parse_judge_response` with a fallback for judges that ignore the format. Metrics are reported with 95% bootstrap confidence intervals via `bootstrap_ci`. Per-sample records (prompt, response, judge prompt, judge raw output, rationale, boolean decision) are written to a JSONL file after each run. For context evaluation, `--prompt-variant-check` re-judges a subset with three prompt framings (A/B/C in `_JUDGE_PROMPT_CONTEXT`) and prints per-variant percentages and Pearson r between each pair of decisions.
 
 ## LoRA comparison (`LoRA` branch)
 

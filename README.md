@@ -75,15 +75,32 @@ python head_probing.py intervene \
 
 **Context-following** — scores all saved model variants against the base model:
 ```bash
-python head_probing.py test-context --dataset pop_qa --num-tests 50
+python head_probing.py test-context --dataset pop_qa --num-tests 1000
 ```
 
 **Truthfulness:**
 ```bash
-python head_probing.py test-truth --num-tests 100 --models-dir Truth/updated_models
+python head_probing.py test-truth --num-tests 1000 --models-dir Truth/updated_models
 ```
 
-Evaluation uses a separate `meta-llama/Meta-Llama-3-8B-Instruct` instance as a judge. Each response is scored independently on two axes — contextual/truthful and informative — and results are reported as three metrics: `context*informative`, `context`, `informative`.
+**Key evaluation flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--judge-model` | `meta-llama/Meta-Llama-3-8B-Instruct` | Which LLM to use as judge |
+| `--bootstrap-iters` | `1000` | Bootstrap resamples for 95% confidence intervals |
+| `--prompt-variant-check` | off | Re-judge a subset with 3 different prompt framings to verify ranking stability (`test-context` only) |
+| `--variant-subset` | `50` | Number of samples for the variant check |
+
+Evaluation uses a judge LLM (configurable via `--judge-model`) loaded at temperature 0 (greedy decoding). The judge is prompted to produce a brief chain-of-thought rationale before emitting a final `Answer: yes/no` decision. Each response is scored on two axes — contextual/truthful and informative — and results are reported as `context*informative [lo, hi]`, `context [lo, hi]`, `informative [lo, hi]` where the brackets are 95% bootstrap confidence intervals.
+
+Per-sample results (prompt, response, judge prompt, judge raw output, rationale, boolean decision) are saved to a JSONL file (`results_context_<model>_<timestamp>.jsonl` or `results_truth_<model>_<timestamp>.jsonl`) after each run.
+
+**Prompt variant check** — run 3 judge prompt framings on a subset to confirm rankings are stable:
+```bash
+python head_probing.py test-context --dataset pop_qa --num-tests 1000 \
+    --prompt-variant-check --variant-subset 100
+```
 
 ### Per-token context rating
 
@@ -151,6 +168,8 @@ python head_probing.py compare --dataset pop_qa --num-tests 50 --ks 16 32 --alph
 | `lora_adapter/` | Saved LoRA adapter weights |
 | `lora_delta.pkl` | Per-head activation delta `[layers, heads, head_dim]` |
 | `updated_models_lora/<model>_top_<k>_alpha_<alpha>_lora_delta/` | Saved LoRA-delta-ITI model |
+| `results_context_<model>_<timestamp>.jsonl` | Per-sample context evaluation log |
+| `results_truth_<model>_<timestamp>.jsonl` | Per-sample truthfulness evaluation log |
 
 ---
 
