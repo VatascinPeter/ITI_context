@@ -409,7 +409,8 @@ def bootstrap_ci(decisions, B=1000):
     n = len(decisions)
     arr = np.array(decisions, dtype=float)
     rng = np.random.default_rng(0)
-    sample_means = [arr[rng.integers(0, n, n)].mean() for _ in range(B)]
+    indices = rng.integers(0, n, size=(B, n))
+    sample_means = arr[indices].mean(axis=1)
     return float(arr.mean()), float(np.percentile(sample_means, 2.5)), float(np.percentile(sample_means, 97.5))
 
 
@@ -757,6 +758,82 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
 
 
+def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=1000):
+    """Re-evaluate already-generated responses from JSONL files using a new judge model.
+
+    Reads each file, re-runs the judge on the saved (context, query, response, corr_answer)
+    fields, overwrites the judge fields in every record, saves a new JSONL alongside the
+    original (suffix ``_rejudged``), and prints metrics in the same format as test-context.
+    No model or dataset access is required.
+    """
+    judge_model, judge_tokenizer = get_model(judge_model_name, quantize=quantize)
+
+    for jsonl_path in jsonl_files:
+        records = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+
+        if not records:
+            print(f"Skipping {jsonl_path}: no records found.")
+            continue
+
+        print(f"\nRejudging {len(records)} records from {jsonl_path} ...")
+        for record in records:
+            answer_str = (
+                f"Context: {record['context']}\nQuestion: {record['query']}\n"
+                f"Generated Response: {record['response']}\nContext-aligned Response: {record['corr_answer']}"
+            )
+            record["judge_model"] = judge_model_name
+            for task_template, key in [
+                (_JUDGE_PROMPT_CONTEXT["A"], "context_A"),
+                (_JUDGE_PROMPT_INFORMATIVE, "informative"),
+            ]:
+                task = task_template.format(answer=answer_str)
+                jp = judge_tokenizer.apply_chat_template(
+                    [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+                )
+                input_ids = judge_tokenizer(jp, return_tensors="pt").to('cuda')
+                with ch.no_grad():
+                    output_ids = judge_model.generate(
+                        **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=judge_tokenizer.eos_token_id
+                    )
+                raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
+                rationale, decision = _parse_judge_response(raw)
+                record[f"judge_prompt_{key}"] = task
+                record[f"judge_raw_{key}"] = raw
+                record[f"rationale_{key}"] = rationale
+                record[f"decision_{key}"] = decision
+
+        out_path = jsonl_path.replace(".jsonl", "_rejudged.jsonl")
+        with open(out_path, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        print(f"Saved: {out_path}")
+
+        decisions_context = [r["decision_context_A"] for r in records]
+        decisions_info    = [r["decision_informative"] for r in records]
+        decisions_both    = [a and b for a, b in zip(decisions_context, decisions_info)]
+        (ti, tilo, tihi) = bootstrap_ci(decisions_both, B=bootstrap_iters)
+        (t,  tlo,  thi)  = bootstrap_ci(decisions_context, B=bootstrap_iters)
+        (i,  ilo,  ihi)  = bootstrap_ci(decisions_info, B=bootstrap_iters)
+
+        # Format label to match test-context output style
+        model_label = records[0].get("model", jsonl_path)
+        m = re.search(r'_top_(\d+)_alpha_([\d.]+)$', model_label)
+        if m:
+            label = f"k={m.group(1)}, alpha={m.group(2)}"
+        else:
+            label = "Base model"
+        print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+
+    del judge_model
+    ch.cuda.empty_cache()
+
+
 def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/updated_models",
                    dataset_path="../TruthfulQA/TruthfulQA.csv", quantize=True,
                    judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
@@ -1085,6 +1162,13 @@ def build_parser():
     p.add_argument("--variant-subset", type=int, default=50, help="Number of samples to use for the prompt variant check")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
+    # --- rejudge ---
+    p = subparsers.add_parser("rejudge", help="Re-evaluate saved responses from JSONL files with a different judge.")
+    p.add_argument("jsonl_files", nargs="+", metavar="JSONL", help="One or more results_context_*.jsonl files to re-judge")
+    p.add_argument("--judge-model", default="meta-llama/Meta-Llama-3-8B-Instruct", help="HuggingFace model ID for the new judge")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
     # --- test-truth ---
     p = subparsers.add_parser("test-truth", help="Evaluate truthfulness on base + intervened models.")
     p.add_argument("--model", **model_kwargs)
@@ -1190,6 +1274,9 @@ def main():
                          quantize=quantize, dataset_path=args.dataset_path,
                          judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
                          prompt_variant_check=args.prompt_variant_check, variant_subset=args.variant_subset)
+
+    elif args.mode == "rejudge":
+        run_rejudge(args.jsonl_files, args.judge_model, quantize=quantize, bootstrap_iters=args.bootstrap_iters)
 
     elif args.mode == "test-truth":
         run_test_truth(args.model, args.ks, args.alphas, args.num_tests, args.models_dir, args.dataset_path,
