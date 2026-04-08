@@ -794,7 +794,7 @@ def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=10
             print(f"Skipping {jsonl_path}: no records found.")
             continue
 
-        print(f"\nRejudging {len(records)} records from {jsonl_path} ...")
+        print(f"\nRejudging {len(records)} records from {jsonl_path} ...", flush=True)
         for record in records:
             answer_str = (
                 f"Context: {record['context']}\nQuestion: {record['query']}\n"
@@ -826,7 +826,7 @@ def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=10
         with open(out_path, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
-        print(f"Saved: {out_path}")
+        print(f"Saved: {out_path}", flush=True)
 
         decisions_context = [r["decision_context_A"] for r in records]
         decisions_info    = [r["decision_informative"] for r in records]
@@ -842,7 +842,7 @@ def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=10
             label = f"k={m.group(1)}, alpha={m.group(2)}"
         else:
             label = "Base model"
-        print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+        print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
 
     del judge_model
     ch.cuda.empty_cache()
