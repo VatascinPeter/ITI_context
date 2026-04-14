@@ -26,14 +26,20 @@ from pathlib import Path
 # Parsing
 # ---------------------------------------------------------------------------
 
-_METRIC_RE = re.compile(
+_METRIC_RE_CONTEXT = re.compile(
     r'context\*informative:\s*([\d.]+)\s*\[([\d.]+),\s*([\d.]+)\]'
     r'.*?context:\s*([\d.]+)\s*\[([\d.]+),\s*([\d.]+)\]'
     r'.*?informative:\s*([\d.]+)\s*\[([\d.]+),\s*([\d.]+)\]'
 )
 
-vmin = 0.6
-vmax = 0.85
+_METRIC_RE_TRUTH = re.compile(
+    r'true\*informative:\s*([\d.]+)\s*\[([\d.]+),\s*([\d.]+)\]'
+    r'.*?true:\s*([\d.]+)\s*\[([\d.]+),\s*([\d.]+)\]'
+    r'.*?informative:\s*([\d.]+)\s*\[([\d.]+),\s*([\d.]+)\]'
+)
+
+# Keep the old name as an alias so any external callers don't break
+_METRIC_RE = _METRIC_RE_CONTEXT
 
 def parse_results_file(filepath):
     """Parse a results file and return a data dict.
@@ -46,7 +52,9 @@ def parse_results_file(filepath):
     dict with keys:
         'model'    : str
         'dataset'  : str
-        'base'     : dict — {'cont_inf': (score, lo, hi), 'context': ..., 'informative': ...}
+        'mode'     : 'context' or 'truth'
+        'base'     : dict — context mode: {'cont_inf': (score, lo, hi), 'context': ..., 'informative': ...}
+                            truth  mode: {'true_inf': (score, lo, hi), 'true': ..., 'informative': ...}
         'variants' : dict — {(k, alpha): same structure as 'base'}
         'ks'       : sorted list[int]
         'alphas'   : sorted list[float]
@@ -57,6 +65,7 @@ def parse_results_file(filepath):
     base = None
     variants = {}
 
+    mode = None  # 'context' or 'truth', detected from first matched line
     header_lines_seen = 0
     with open(filepath) as f:
         for line in f:
@@ -74,16 +83,29 @@ def parse_results_file(filepath):
                 header_lines_seen += 1
                 continue
 
-            m = _METRIC_RE.search(stripped)
-            if not m:
-                continue
-
-            vals = tuple(float(x) for x in m.groups())
-            entry = {
-                'cont_inf':    (vals[0], vals[1], vals[2]),
-                'context':     (vals[3], vals[4], vals[5]),
-                'informative': (vals[6], vals[7], vals[8]),
-            }
+            m = _METRIC_RE_CONTEXT.search(stripped)
+            if m:
+                if mode is None:
+                    mode = 'context'
+                vals = tuple(float(x) for x in m.groups())
+                entry = {
+                    'cont_inf':    (vals[0], vals[1], vals[2]),
+                    'context':     (vals[3], vals[4], vals[5]),
+                    'informative': (vals[6], vals[7], vals[8]),
+                }
+            else:
+                m = _METRIC_RE_TRUTH.search(stripped)
+                if m:
+                    if mode is None:
+                        mode = 'truth'
+                    vals = tuple(float(x) for x in m.groups())
+                    entry = {
+                        'true_inf':    (vals[0], vals[1], vals[2]),
+                        'true':        (vals[3], vals[4], vals[5]),
+                        'informative': (vals[6], vals[7], vals[8]),
+                    }
+                else:
+                    continue
 
             if 'Base model' in stripped:
                 base = entry
@@ -103,6 +125,7 @@ def parse_results_file(filepath):
     return {
         'model': model,
         'dataset': dataset,
+        'mode': mode or 'context',
         'base': base,
         'variants': variants,
         'ks': ks,
@@ -141,13 +164,15 @@ def _text_color(norm_value, cmap):
     return 'white' if luminance < 0.45 else 'black'
 
 
-def _plot_metric(data, metric_key, title, cmap, output_path=None):
-    """Core plotting function used by the e public functions.
+def _plot_metric(data, metric_key, title, cmap, output_path=None, vmin=None, vmax=None):
+    """Core plotting function used by the public functions.
 
-    Produces two stacked subplots sharing a colormap normalised to [0, 1]:
+    Produces two stacked subplots sharing a colormap normalised to [vmin, vmax]:
       - Top:    base model as a single full-width cell
       - Bottom: k × alpha matrix
     Cell text format: "score\n[lo, hi]"  (lo/hi are 2.5th / 97.5th percentiles)
+
+    vmin/vmax default to the min/max of all scores in the data when not given.
     """
     ks = data['ks']
     alphas = data['alphas']
@@ -159,6 +184,12 @@ def _plot_metric(data, metric_key, title, cmap, output_path=None):
 
     score_mat, lo_mat, hi_mat = _build_score_matrix(data, metric_key)
     base_s, base_lo, base_hi  = data['base'][metric_key]
+
+    all_scores = np.concatenate([score_mat[~np.isnan(score_mat)], [base_s]])
+    if vmin is None:
+        vmin = float(np.min(all_scores))
+    if vmax is None:
+        vmax = float(np.max(all_scores))
 
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
@@ -226,13 +257,16 @@ def _plot_metric(data, metric_key, title, cmap, output_path=None):
         plt.show()
     plt.close(fig)
 
-def _plot_percent(data, metric_key, title, cmap, output_path=None):
-    """Core plotting function used by the three public functions.
+def _plot_percent(data, metric_key, title, cmap, output_path=None, vmin=None, vmax=None):
+    """Core plotting function used by the public functions (percentage variant).
 
-    Produces two stacked subplots sharing a colormap normalised to [0, 1]:
+    Produces two stacked subplots sharing a colormap normalised to [vmin, vmax]:
       - Top:    base model as a single full-width cell
       - Bottom: k × alpha matrix
     Cell text format: "score\n[lo, hi]"  (lo/hi are 2.5th / 97.5th percentiles)
+
+    vmin/vmax are in [0, 1] (same as the non-percent variant) and are scaled
+    internally. They default to the min/max of all scores when not given.
     """
     ks = data['ks']
     alphas = data['alphas']
@@ -244,6 +278,13 @@ def _plot_percent(data, metric_key, title, cmap, output_path=None):
 
     score_mat, lo_mat, hi_mat = _build_score_matrix(data, metric_key)
     base_s, base_lo, base_hi  = data['base'][metric_key]
+
+    all_scores = np.concatenate([score_mat[~np.isnan(score_mat)], [base_s]])
+    if vmin is None:
+        vmin = float(np.min(all_scores))
+    if vmax is None:
+        vmax = float(np.max(all_scores))
+
     base_s *= 100
     base_lo *= 100
     base_hi *= 100
@@ -318,7 +359,7 @@ def _plot_percent(data, metric_key, title, cmap, output_path=None):
 # Public plotting functions
 # ---------------------------------------------------------------------------
 
-def plot_cont_informative(data, cmap='viridis', output_path=None, perc=False):
+def plot_cont_informative(data, cmap='viridis', output_path=None, perc=False, vmin=None, vmax=None):
     """Plot the context × informative composite metric.
 
     Parameters
@@ -326,19 +367,21 @@ def plot_cont_informative(data, cmap='viridis', output_path=None, perc=False):
     data : dict
         Parsed data dict from :func:`parse_results_file`.
     cmap : str
-        Matplotlib colormap name. Normalisation is always [0, 1].
+        Matplotlib colormap name.
     output_path : str or Path, optional
         Save the figure here instead of displaying it.
-    perc: bool, optional
-        Plot in Percents
+    perc : bool, optional
+        Plot in Percents.
+    vmin, vmax : float or None
+        Colormap bounds in [0, 1]. Defaults to data min/max when None.
     """
     if perc:
-        _plot_percent(data, 'cont_inf', 'Cont*Informative', cmap, output_path)
+        _plot_percent(data, 'cont_inf', 'Cont*Informative', cmap, output_path, vmin=vmin, vmax=vmax)
     else:
-        _plot_metric(data, 'cont_inf', 'Cont*Informative', cmap, output_path)
+        _plot_metric(data, 'cont_inf', 'Cont*Informative', cmap, output_path, vmin=vmin, vmax=vmax)
 
 
-def plot_contextual(data, cmap='viridis', output_path=None, perc=False):
+def plot_contextual(data, cmap='viridis', output_path=None, perc=False, vmin=None, vmax=None):
     """Plot the contextual metric.
 
     Parameters
@@ -346,19 +389,21 @@ def plot_contextual(data, cmap='viridis', output_path=None, perc=False):
     data : dict
         Parsed data dict from :func:`parse_results_file`.
     cmap : str
-        Matplotlib colormap name. Normalisation is always [0, 1].
+        Matplotlib colormap name.
     output_path : str or Path, optional
         Save the figure here instead of displaying it.
-    perc: bool, optional
-        Plot in Percents
+    perc : bool, optional
+        Plot in Percents.
+    vmin, vmax : float or None
+        Colormap bounds in [0, 1]. Defaults to data min/max when None.
     """
     if perc:
-        _plot_percent(data, 'context', 'Contextual', cmap, output_path)
+        _plot_percent(data, 'context', 'Contextual', cmap, output_path, vmin=vmin, vmax=vmax)
     else:
-        _plot_metric(data, 'context', 'Contextual', cmap, output_path)
+        _plot_metric(data, 'context', 'Contextual', cmap, output_path, vmin=vmin, vmax=vmax)
 
 
-def plot_informative(data, cmap='viridis', output_path=None, perc=False):
+def plot_informative(data, cmap='viridis', output_path=None, perc=False, vmin=None, vmax=None):
     """Plot the informative metric.
 
     Parameters
@@ -366,16 +411,62 @@ def plot_informative(data, cmap='viridis', output_path=None, perc=False):
     data : dict
         Parsed data dict from :func:`parse_results_file`.
     cmap : str
-        Matplotlib colormap name. Normalisation is always [0, 1].
+        Matplotlib colormap name.
     output_path : str or Path, optional
         Save the figure here instead of displaying it.
-    perc: bool, optional
-        Plot in Percents
+    perc : bool, optional
+        Plot in Percents.
+    vmin, vmax : float or None
+        Colormap bounds in [0, 1]. Defaults to data min/max when None.
     """
     if perc:
-        _plot_percent(data, 'informative', 'Informative', cmap, output_path)
+        _plot_percent(data, 'informative', 'Informative', cmap, output_path, vmin=vmin, vmax=vmax)
     else:
-        _plot_metric(data, 'informative', 'Informative', cmap, output_path)
+        _plot_metric(data, 'informative', 'Informative', cmap, output_path, vmin=vmin, vmax=vmax)
+
+
+def plot_true_informative(data, cmap='viridis', output_path=None, perc=False, vmin=None, vmax=None):
+    """Plot the true × informative composite metric (truth results files).
+
+    Parameters
+    ----------
+    data : dict
+        Parsed data dict from :func:`parse_results_file`.
+    cmap : str
+        Matplotlib colormap name.
+    output_path : str or Path, optional
+        Save the figure here instead of displaying it.
+    perc : bool, optional
+        Plot in Percents.
+    vmin, vmax : float or None
+        Colormap bounds in [0, 1]. Defaults to data min/max when None.
+    """
+    if perc:
+        _plot_percent(data, 'true_inf', 'True*Informative', cmap, output_path, vmin=vmin, vmax=vmax)
+    else:
+        _plot_metric(data, 'true_inf', 'True*Informative', cmap, output_path, vmin=vmin, vmax=vmax)
+
+
+def plot_truthful(data, cmap='viridis', output_path=None, perc=False, vmin=None, vmax=None):
+    """Plot the truthful metric (truth results files).
+
+    Parameters
+    ----------
+    data : dict
+        Parsed data dict from :func:`parse_results_file`.
+    cmap : str
+        Matplotlib colormap name.
+    output_path : str or Path, optional
+        Save the figure here instead of displaying it.
+    perc : bool, optional
+        Plot in Percents.
+    vmin, vmax : float or None
+        Colormap bounds in [0, 1]. Defaults to data min/max when None.
+    """
+    if perc:
+        _plot_percent(data, 'true', 'Truthful', cmap, output_path, vmin=vmin, vmax=vmax)
+    else:
+        _plot_metric(data, 'true', 'Truthful', cmap, output_path, vmin=vmin, vmax=vmax)
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +550,11 @@ def plot_probe_scatter(truth_path, context_path, cmap='viridis', threshold=None,
     ax.axvline(t_thr, color='#555555', linestyle='--', linewidth=0.9, alpha=0.8)
     ax.axhline(c_thr, color='#555555', linestyle='--', linewidth=0.9, alpha=0.8)
 
+    # y = x line: heads above it have higher context accuracy than truth accuracy
+    lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]),
+            max(ax.get_xlim()[1], ax.get_ylim()[1])]
+    ax.plot(lims, lims, color='#888888', linestyle='-', linewidth=0.8, alpha=0.6)
+
     # Quadrant labels — placed at the midpoint of each quadrant
     xlim = ax.get_xlim()
     ylim = ax.get_ylim()
@@ -468,8 +564,8 @@ def plot_probe_scatter(truth_path, context_path, cmap='viridis', threshold=None,
     ax.text((xlim[0] + t_thr) / 2, (ylim[0] + c_thr) / 2, 'neither',             **label_kw)
     ax.text((xlim[1] + t_thr) / 2, (ylim[0] + c_thr) / 2, 'truth\nspecialist',   **label_kw)
 
-    ax.set_xlabel(f'Truth probe accuracy{unit}', fontsize=11)
-    ax.set_ylabel(f'Context probe accuracy{unit}', fontsize=11)
+    ax.set_xlabel(f'Truth probe accuracy ({unit})', fontsize=11)
+    ax.set_ylabel(f'Context probe accuracy ({unit})', fontsize=11)
     ax.set_title(
         'Attention head probe accuracies: Truthfulness vs. Context Grounding',
         fontsize=11,
@@ -506,9 +602,11 @@ def main():
     )
     parser.add_argument(
         '--metric',
-        choices=['cont_inf', 'context', 'informative', 'all'],
+        choices=['cont_inf', 'context', 'informative', 'true_inf', 'true', 'all'],
         default='all',
-        help='Which metric figure(s) to produce (default: all)',
+        help='Which metric figure(s) to produce (default: all). '
+             'Context-mode metrics: cont_inf, context, informative. '
+             'Truth-mode metrics: true_inf, true, informative.',
     )
     parser.add_argument(
         '--output-dir', default=None,
@@ -530,6 +628,16 @@ def main():
         '--threshold', type=float, default=None, metavar='FLOAT',
         help='Quadrant threshold in [0, 1] for the scatter plot '
              '(default: 75th percentile of each distribution independently)',
+    )
+    parser.add_argument(
+        '--vmin', type=float, default=None, metavar='FLOAT',
+        help='Colormap lower bound in [0, 1] for heatmap plots '
+             '(default: minimum score in the data)',
+    )
+    parser.add_argument(
+        '--vmax', type=float, default=None, metavar='FLOAT',
+        help='Colormap upper bound in [0, 1] for heatmap plots '
+             '(default: maximum score in the data)',
     )
     args = parser.parse_args()
 
@@ -567,12 +675,28 @@ def main():
     print(f"alphas:   {data['alphas']}")
     print(f"Variants: {len(data['variants'])}")
 
-    if args.metric in ('cont_inf', 'all'):
-        plot_cont_informative(data, cmap=args.cmap, output_path=out('cont_informative.png'), perc=percentage)
-    if args.metric in ('context', 'all'):
-        plot_contextual(data, cmap=args.cmap, output_path=out('contextual.png'), perc=percentage)
-    if args.metric in ('informative', 'all'):
-        plot_informative(data, cmap=args.cmap, output_path=out('informative.png'), perc=percentage)
+    is_truth = data['mode'] == 'truth'
+    plot_kw = dict(cmap=args.cmap, perc=percentage, vmin=args.vmin, vmax=args.vmax)
+
+    if args.metric == 'all':
+        if is_truth:
+            plot_true_informative(data, output_path=out('true_informative.png'), **plot_kw)
+            plot_truthful(data, output_path=out('truthful.png'), **plot_kw)
+            plot_informative(data, output_path=out('informative.png'), **plot_kw)
+        else:
+            plot_cont_informative(data, output_path=out('cont_informative.png'), **plot_kw)
+            plot_contextual(data, output_path=out('contextual.png'), **plot_kw)
+            plot_informative(data, output_path=out('informative.png'), **plot_kw)
+    else:
+        dispatch = {
+            'cont_inf':    (plot_cont_informative, 'cont_informative.png'),
+            'context':     (plot_contextual,        'contextual.png'),
+            'true_inf':    (plot_true_informative,  'true_informative.png'),
+            'true':        (plot_truthful,           'truthful.png'),
+            'informative': (plot_informative,        'informative.png'),
+        }
+        fn, fname = dispatch[args.metric]
+        fn(data, output_path=out(fname), **plot_kw)
 
 
 if __name__ == '__main__':
