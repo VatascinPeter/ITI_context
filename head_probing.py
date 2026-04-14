@@ -733,8 +733,12 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
                      quantize=True, dataset_path=None,
                      judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                      bootstrap_iters=1000, prompt_variant_check=False, variant_subset=50, seed=42,
-                     output_dir=None):
-    """Evaluate context-following on the base model and all intervened variants."""
+                     output_dir=None, explicit_models=None):
+    """Evaluate context-following on the base model and all intervened variants.
+
+    If ``explicit_models`` is provided (a list of model paths), only those models
+    are evaluated — the base-model run and the k/alpha sweep are skipped.
+    """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -743,6 +747,23 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
         safe = label.replace('/', '_').replace(' ', '_')
         filename = f"results_context_{safe}_{ts}.jsonl"
         return os.path.join(output_dir, filename) if output_dir else None
+
+    if explicit_models:
+        # Load the tokenizer from the base model name (for the chat template etc.)
+        _, tokenizer = get_model(model_name, quantize=quantize)
+        for model_path in explicit_models:
+            if not os.path.exists(model_path):
+                print(f"Skipping {model_path} (not found)")
+                continue
+            label = model_path
+            explicit_model = AutoModelForCausalLM.from_pretrained(model_path, device_map="cuda")
+            (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
+                explicit_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
+                judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
+                model_label=label, seed=seed, results_file=_results_path(label),
+            )
+            print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+        return
 
     model, tokenizer = get_model(model_name, quantize=quantize)
     (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
@@ -851,8 +872,12 @@ def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=10
 def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/updated_models",
                    dataset_path="../TruthfulQA/TruthfulQA.csv", quantize=True,
                    judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
-                   bootstrap_iters=1000, output_dir=None):
-    """Evaluate truthfulness on the base model and all intervened variants."""
+                   bootstrap_iters=1000, output_dir=None, explicit_models=None):
+    """Evaluate truthfulness on the base model and all intervened variants.
+
+    If ``explicit_models`` is provided (a list of model paths), only those models
+    are evaluated — the base-model run and the k/alpha sweep are skipped.
+    """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -861,6 +886,23 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
         safe = label.replace('/', '_').replace(' ', '_')
         filename = f"results_truth_{safe}_{ts}.jsonl"
         return os.path.join(output_dir, filename) if output_dir else None
+
+    if explicit_models:
+        # Load the tokenizer from the base model name
+        _, tokenizer = get_model(model_name, quantize=quantize)
+        for model_path in explicit_models:
+            if not os.path.exists(model_path):
+                print(f"Skipping {model_path} (not found)")
+                continue
+            label = model_path
+            explicit_model = AutoModelForCausalLM.from_pretrained(model_path, device_map="cuda")
+            (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
+                explicit_model, tokenizer, dataset_path, num_tests, quantize=quantize,
+                judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
+                model_label=label, results_file=_results_path(label),
+            )
+            print(f"{label} — true*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  true: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+        return
 
     model, tokenizer = get_model(model_name, quantize=quantize)
     (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
@@ -1186,6 +1228,8 @@ def build_parser():
     p.add_argument("--variant-subset", type=int, default=50, help="Number of samples to use for the prompt variant check")
     p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling (default: 42)")
     p.add_argument("--output-dir", default=None, help="Directory to save results JSONL files (default: current directory)")
+    p.add_argument("--models", nargs="+", default=None, metavar="MODEL_PATH",
+                   help="Explicit model paths to evaluate. When set, skips the base model and k/alpha sweep.")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- rejudge ---
@@ -1206,6 +1250,8 @@ def build_parser():
     p.add_argument("--judge-model", default="meta-llama/Meta-Llama-3-8B-Instruct", help="HuggingFace model ID for the LLM judge")
     p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
     p.add_argument("--output-dir", default=None, help="Directory to save results JSONL files (default: current directory)")
+    p.add_argument("--models", nargs="+", default=None, metavar="MODEL_PATH",
+                   help="Explicit model paths to evaluate. When set, skips the base model and k/alpha sweep.")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
     # --- rate ---
@@ -1301,7 +1347,7 @@ def main():
                          quantize=quantize, dataset_path=args.dataset_path,
                          judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
                          prompt_variant_check=args.prompt_variant_check, variant_subset=args.variant_subset,
-                         seed=args.seed, output_dir=args.output_dir)
+                         seed=args.seed, output_dir=args.output_dir, explicit_models=args.models)
 
     elif args.mode == "rejudge":
         run_rejudge(args.jsonl_files, args.judge_model, quantize=quantize, bootstrap_iters=args.bootstrap_iters)
@@ -1309,7 +1355,7 @@ def main():
     elif args.mode == "test-truth":
         run_test_truth(args.model, args.ks, args.alphas, args.num_tests, args.models_dir, args.dataset_path,
                        quantize=quantize, judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
-                       output_dir=args.output_dir)
+                       output_dir=args.output_dir, explicit_models=args.models)
 
     elif args.mode == "rate":
         acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
