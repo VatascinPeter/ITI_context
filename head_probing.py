@@ -305,7 +305,7 @@ def model_intervention(model, model_name, probes, activations, accuracies, k=64,
         shutil.rmtree(save_folder)
     os.makedirs(save_folder)
     model.config.attention_bias = True
-    model.save_pretrained(save_folder, safe_serialization=False, max_shard_size="10GB")
+    model.save_pretrained(save_folder, safe_serialization=True, max_shard_size="10GB")
     print(f"Saved intervened model to {save_folder}")
 
 
@@ -568,7 +568,8 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
                judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                results_file=None, bootstrap_iters=1000, model_label="",
                gpt_judge_truth_model=None, gpt_judge_info_model=None,
-               hf_judge_truth_model=None, hf_judge_info_model=None):
+               hf_judge_truth_model=None, hf_judge_info_model=None,
+               quantize_judge=None):
     """Evaluate truthfulness of ``model`` on TruthfulQA.
 
     Judge options (mutually exclusive; if none given, uses ``judge_model_name``):
@@ -667,7 +668,8 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
             record["rationale_informative"]   = ""
             record["decision_informative"]    = info_decision
     else:
-        judge_model, judge_tokenizer = get_model(judge_model_name, quantize=quantize)
+        _qj = quantize_judge if quantize_judge is not None else quantize
+        judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
         for record in records:
             answer_str = record.pop("_answer_str")
             record["judge_model"] = judge_model_name
@@ -715,7 +717,7 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
                  judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                  results_file=None, bootstrap_iters=1000,
                  prompt_variant_check=False, variant_subset=50,
-                 model_label="", seed=42):
+                 model_label="", seed=42, quantize_judge=None):
     start = time.time()
     records = []
     random.seed(seed)
@@ -757,7 +759,8 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
 
     model.to('cpu')
     del model
-    judge_model, judge_tokenizer = get_model(judge_model_name, quantize=quantize)
+    _qj = quantize_judge if quantize_judge is not None else quantize
+    judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
 
     for record in records:
         answer_str = record.pop("_answer_str")
@@ -891,11 +894,47 @@ def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_d
             del model
 
 
+def _load_explicit_model(model_path, fallback_tokenizer_name, quantize):
+    """Load an explicit model for evaluation, handling two special cases:
+
+    1. Pre-quantized local models (ITI variants saved from a quantized base):
+       the config.json already contains a ``quantization_config``; passing a new
+       one causes a transformers conflict.  We load without a new bnb_config and
+       let transformers reuse the saved one.
+
+    2. No tokenizer files (ITI models only save weights): fall back to loading
+       the tokenizer from ``fallback_tokenizer_name`` (the ``--model`` base model).
+    """
+    is_local_dir = os.path.isdir(model_path)
+
+    # Detect pre-quantized local model
+    is_pre_quantized = False
+    if is_local_dir:
+        cfg_path = os.path.join(model_path, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                is_pre_quantized = json.load(f).get("quantization_config") is not None
+
+    if is_pre_quantized:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, attn_implementation="eager", device_map="auto"
+        )
+    else:
+        model, _ = get_model(model_path, quantize=quantize)
+
+    # Tokenizer: use the model's own if available, else fall back to base model
+    has_tokenizer = is_local_dir and os.path.exists(os.path.join(model_path, "tokenizer.json"))
+    tok_source = model_path if has_tokenizer else fallback_tokenizer_name
+    tokenizer = AutoTokenizer.from_pretrained(tok_source)
+
+    return model, tokenizer
+
+
 def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models",
                      quantize=True, dataset_path=None,
                      judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                      bootstrap_iters=1000, prompt_variant_check=False, variant_subset=50, seed=42,
-                     output_dir=None, explicit_models=None):
+                     output_dir=None, explicit_models=None, quantize_judge=None):
     """Evaluate context-following on the base model and all intervened variants.
 
     If ``explicit_models`` is provided (a list of model paths), only those models
@@ -911,19 +950,18 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
         return os.path.join(output_dir, filename) if output_dir else None
 
     if explicit_models:
-        # Load the tokenizer from the base model name (for the chat template etc.)
-        _, tokenizer = get_model(model_name, quantize=quantize)
         for model_path in explicit_models:
-            is_hf_id = not model_path.startswith("/") and "/" in model_path
+            is_hf_id = not os.path.isabs(model_path) and "/" in model_path and not os.path.exists(model_path)
             if not is_hf_id and not os.path.exists(model_path):
                 print(f"Skipping {model_path} (not found)")
                 continue
             label = model_path
-            explicit_model = AutoModelForCausalLM.from_pretrained(model_path, device_map="cuda")
+            explicit_model, tokenizer = _load_explicit_model(model_path, model_name, quantize)
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
                 explicit_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
                 model_label=label, seed=seed, results_file=_results_path(label),
+                quantize_judge=quantize_judge,
             )
             print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
         return
@@ -934,6 +972,7 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
         judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
         prompt_variant_check=prompt_variant_check, variant_subset=variant_subset,
         model_label=model_name, seed=seed, results_file=_results_path(model_name),
+        quantize_judge=quantize_judge,
     )
     model.to('cpu')
     del model
@@ -951,6 +990,7 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
                 variant_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
                 model_label=label, seed=seed, results_file=_results_path(label),
+                quantize_judge=quantize_judge,
             )
             # variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
@@ -1037,7 +1077,8 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
                    judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                    bootstrap_iters=1000, output_dir=None, explicit_models=None,
                    gpt_judge_truth_model=None, gpt_judge_info_model=None,
-                   hf_judge_truth_model=None, hf_judge_info_model=None):
+                   hf_judge_truth_model=None, hf_judge_info_model=None,
+                   quantize_judge=None):
     """Evaluate truthfulness on the base model and all intervened variants.
 
     If ``explicit_models`` is provided (a list of model paths), only those models
@@ -1046,6 +1087,8 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
     Pass ``hf_judge_truth_model`` / ``hf_judge_info_model`` (local HF model paths)
     or ``gpt_judge_truth_model`` / ``gpt_judge_info_model`` (OpenAI model IDs) to
     use dedicated judge models instead of the generic ``judge_model_name``.
+    ``quantize_judge`` controls quantization of the generic judge independently of
+    the evaluated model; defaults to the value of ``quantize`` when not set.
     """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
@@ -1056,27 +1099,26 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
         filename = f"results_truth_{safe}_{ts}.jsonl"
         return os.path.join(output_dir, filename) if output_dir else None
 
-    gpt_judge_kwargs = dict(
+    judge_kwargs = dict(
         gpt_judge_truth_model=gpt_judge_truth_model,
         gpt_judge_info_model=gpt_judge_info_model,
         hf_judge_truth_model=hf_judge_truth_model,
         hf_judge_info_model=hf_judge_info_model,
+        quantize_judge=quantize_judge,
     )
 
     if explicit_models:
-        # Load the tokenizer from the base model name
-        _, tokenizer = get_model(model_name, quantize=quantize)
         for model_path in explicit_models:
-            is_hf_id = not model_path.startswith("/") and "/" in model_path
+            is_hf_id = not os.path.isabs(model_path) and "/" in model_path and not os.path.exists(model_path)
             if not is_hf_id and not os.path.exists(model_path):
                 print(f"Skipping {model_path} (not found)")
                 continue
             label = model_path
-            explicit_model = AutoModelForCausalLM.from_pretrained(model_path, device_map="cuda")
+            explicit_model, tokenizer = _load_explicit_model(model_path, model_name, quantize)
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
                 explicit_model, tokenizer, dataset_path, num_tests, quantize=quantize,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
-                model_label=label, results_file=_results_path(label), **gpt_judge_kwargs,
+                model_label=label, results_file=_results_path(label), **judge_kwargs,
             )
             print(f"{label} — true*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  true: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
         return
@@ -1085,7 +1127,7 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
     (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
         model, tokenizer, dataset_path, num_tests, quantize=quantize,
         judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
-        model_label=model_name, results_file=_results_path(model_name), **gpt_judge_kwargs,
+        model_label=model_name, results_file=_results_path(model_name), **judge_kwargs,
     )
     model.to('cpu')
     print(f"Base model — true*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  true: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
@@ -1101,7 +1143,7 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
                 variant_model, tokenizer, dataset_path, num_tests, quantize=quantize,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
-                model_label=label, results_file=_results_path(label), **gpt_judge_kwargs,
+                model_label=label, results_file=_results_path(label), **judge_kwargs,
             )
             variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — true*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  true: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
@@ -1215,7 +1257,7 @@ def model_intervention_from_delta(model, model_name, delta, base_activations, k,
         shutil.rmtree(save_folder)
     os.makedirs(save_folder)
     model.config.attention_bias = True
-    model.save_pretrained(save_folder, safe_serialization=False, max_shard_size="10GB")
+    model.save_pretrained(save_folder, safe_serialization=True, max_shard_size="10GB")
     print(f"Saved LoRA-delta intervened model to {save_folder}")
 
 
@@ -1408,6 +1450,8 @@ def build_parser():
     p.add_argument("--models", nargs="+", default=None, metavar="MODEL_PATH",
                    help="Explicit model paths to evaluate. When set, skips the base model and k/alpha sweep.")
     p.add_argument("--no-quantize", **quantize_kwargs)
+    p.add_argument("--no-quantize-judge", action="store_true", dest="no_quantize_judge",
+                   help="Load the judge model in full precision regardless of --no-quantize")
 
     # --- rejudge ---
     p = subparsers.add_parser("rejudge", help="Re-evaluate saved responses from JSONL files with a different judge.")
@@ -1446,6 +1490,8 @@ def build_parser():
                    help="Fine-tuned OpenAI completions model ID for informativeness (GPT-info). "
                         "Both --gpt-judge-truth-model and --gpt-judge-info-model must be set together.")
     p.add_argument("--no-quantize", **quantize_kwargs)
+    p.add_argument("--no-quantize-judge", action="store_true", dest="no_quantize_judge",
+                   help="Load the judge model in full precision regardless of --no-quantize")
 
     # --- rate ---
     p = subparsers.add_parser("rate", help="Generate answers with per-token context-alignment ratings.")
@@ -1536,23 +1582,27 @@ def main():
         run_intervene(args.model, args.activations, args.probes, acc_path, args.ks, args.alphas, args.output_dir, quantize=quantize)
 
     elif args.mode == "test-context":
+        quantize_judge = False if getattr(args, "no_quantize_judge", False) else None
         run_test_context(args.model, args.dataset, args.ks, args.alphas, args.num_tests, args.models_dir,
                          quantize=quantize, dataset_path=args.dataset_path,
                          judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
                          prompt_variant_check=args.prompt_variant_check, variant_subset=args.variant_subset,
-                         seed=args.seed, output_dir=args.output_dir, explicit_models=args.models)
+                         seed=args.seed, output_dir=args.output_dir, explicit_models=args.models,
+                         quantize_judge=quantize_judge)
 
     elif args.mode == "rejudge":
         run_rejudge(args.jsonl_files, args.judge_model, quantize=quantize, bootstrap_iters=args.bootstrap_iters)
 
     elif args.mode == "test-truth":
+        quantize_judge = False if getattr(args, "no_quantize_judge", False) else None
         run_test_truth(args.model, args.ks, args.alphas, args.num_tests, args.models_dir, args.dataset_path,
                        quantize=quantize, judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
                        output_dir=args.output_dir, explicit_models=args.models,
                        hf_judge_truth_model=args.hf_judge_truth_model,
                        hf_judge_info_model=args.hf_judge_info_model,
                        gpt_judge_truth_model=args.gpt_judge_truth_model,
-                       gpt_judge_info_model=args.gpt_judge_info_model)
+                       gpt_judge_info_model=args.gpt_judge_info_model,
+                       quantize_judge=quantize_judge)
 
     elif args.mode == "rate":
         acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
