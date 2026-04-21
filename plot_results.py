@@ -582,6 +582,218 @@ def plot_probe_scatter(truth_path, context_path, cmap='viridis', threshold=None,
 
 
 # ---------------------------------------------------------------------------
+# Prob-experiment heatmaps
+# ---------------------------------------------------------------------------
+
+_PROB_CATEGORIES = [
+    ('true',  'matching'),
+    ('true',  'non_matching'),
+    ('true',  'no_context'),
+    ('false', 'matching'),
+    ('false', 'non_matching'),
+    ('false', 'no_context'),
+]
+
+_PROB_TITLES = {
+    ('true',  'matching'):     'True answer — matching context',
+    ('true',  'non_matching'): 'True answer — non-matching context',
+    ('true',  'no_context'):   'True answer — no context',
+    ('false', 'matching'):     'False answer — matching context',
+    ('false', 'non_matching'): 'False answer — non-matching context',
+    ('false', 'no_context'):   'False answer — no context',
+}
+
+_PROB_ENTRY_RE = re.compile(
+    r'(true|false)/(matching|non_matching|no_context)=(-?[\d.]+)\s*\[(-?[\d.]+),(-?[\d.]+)\]'
+)
+
+
+def parse_prob_file(filepath):
+    """Parse a prob-experiment output file (prob_iti_output2.txt format).
+
+    Looks for lines of the form:
+        <model_label>  (<time>s)
+          true/matching=X [lo,hi]  true/non_matching=X ...  (6 categories)
+
+    Returns
+    -------
+    dict with keys:
+        'model'    : str  — base model name
+        'base'     : dict — {category_key: (mean, lo, hi)}
+        'variants' : dict — {(k, alpha): same}
+        'ks'       : sorted list[int]
+        'alphas'   : sorted list[float]
+    """
+    filepath = Path(filepath)
+    base = None
+    variants = {}
+    model_name = None
+    pending_label = None
+
+    label_re = re.compile(r'^\S.*\([\d.]+s\)\s*$')
+
+    with open(filepath) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            if label_re.match(stripped):
+                pending_label = stripped
+                continue
+
+            if 'true/matching=' in stripped and pending_label is not None:
+                matches = _PROB_ENTRY_RE.findall(stripped)
+                if len(matches) == 6:
+                    entry = {
+                        f'{cat}/{sub}': (float(mean), float(lo), float(hi))
+                        for cat, sub, mean, lo, hi in matches
+                    }
+                    vm = re.search(r'_top_(\d+)_alpha_([\d.]+)\s+\(', pending_label)
+                    if vm:
+                        k = int(vm.group(1))
+                        alpha = float(vm.group(2))
+                        variants[(k, alpha)] = entry
+                    else:
+                        base = entry
+                        model_name = re.sub(r'\s+\([\d.]+s\)\s*$', '', pending_label)
+                    pending_label = None
+
+    if base is None:
+        raise ValueError(f"No base-model result line found in {filepath}")
+
+    ks     = sorted({k for k, _ in variants})
+    alphas = sorted({a for _, a in variants})
+
+    return {
+        'model':    model_name or filepath.stem,
+        'base':     base,
+        'variants': variants,
+        'ks':       ks,
+        'alphas':   alphas,
+    }
+
+
+def _build_prob_matrix(data, category_key):
+    """Return score, lo, hi arrays of shape (len(ks), len(alphas))."""
+    ks, alphas = data['ks'], data['alphas']
+    shape = (len(ks), len(alphas))
+    score = np.full(shape, np.nan)
+    lo    = np.full(shape, np.nan)
+    hi    = np.full(shape, np.nan)
+    for ki, k in enumerate(ks):
+        for ai, alpha in enumerate(alphas):
+            entry = data['variants'].get((k, alpha))
+            if entry and category_key in entry:
+                score[ki, ai], lo[ki, ai], hi[ki, ai] = entry[category_key]
+    return score, lo, hi
+
+
+def _plot_prob_heatmap(data, category_key, title, cmap, output_path, vmin, vmax):
+    ks     = data['ks']
+    alphas = data['alphas']
+    nk     = len(ks)
+    ncols  = len(alphas)
+
+    score_mat, lo_mat, hi_mat = _build_prob_matrix(data, category_key)
+    base_s, base_lo, base_hi  = data['base'][category_key]
+
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+    cell_w = 2.2
+    cell_h = 1.0
+    fig_w  = cell_w * ncols + 2.5
+    fig_h  = cell_h * (nk + 1) + 2.5
+
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs  = fig.add_gridspec(2, 1, height_ratios=[1, nk], hspace=0.08)
+    ax_base = fig.add_subplot(gs[0])
+    ax_main = fig.add_subplot(gs[1])
+
+    # Base row
+    ax_base.imshow([[base_s]], cmap=cmap, norm=norm, aspect='auto')
+    tc = _text_color(norm(base_s), cmap)
+    ax_base.text(0.5, 0.5,
+                 f'{base_s:.3f}\n[{base_lo:.3f}, {base_hi:.3f}]',
+                 ha='center', va='center', fontsize=8,
+                 color=tc, fontweight='bold', linespacing=1.4,
+                 transform=ax_base.transAxes)
+    ax_base.set_yticks([0])
+    ax_base.set_yticklabels(['base'], fontsize=10)
+    ax_base.set_xticks([])
+    ax_base.tick_params(bottom=False)
+
+    # k × alpha matrix
+    ax_main.imshow(score_mat, cmap=cmap, norm=norm, aspect='auto')
+    ax_main.set_xticks(range(ncols))
+    ax_main.set_xticklabels([f'α={a:g}' for a in alphas], rotation=45, ha='right', fontsize=10)
+    ax_main.set_yticks(range(nk))
+    ax_main.set_yticklabels([f'k={k}' for k in ks], fontsize=10)
+
+    for r in range(nk):
+        for c in range(ncols):
+            s = score_mat[r, c]
+            if not np.isnan(s):
+                tc = _text_color(norm(s), cmap)
+                ax_main.text(c, r,
+                             f'{s:.3f}\n[{lo_mat[r, c]:.3f}, {hi_mat[r, c]:.3f}]',
+                             ha='center', va='center', fontsize=8,
+                             color=tc, fontweight='bold', linespacing=1.4)
+
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=[ax_base, ax_main], orientation='vertical',
+                        fraction=0.046, pad=0.04)
+    cbar.set_label('Mean log-prob (higher = more likely)', fontsize=9)
+
+    ax_base.set_title(
+        f'{title}\nModel: {data["model"]}\n'
+        f'Values in brackets are [2.5th, 97.5th] percentiles',
+        fontsize=10, pad=10,
+    )
+
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f'Saved: {output_path}')
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_prob_heatmaps(data, cmap='viridis', output_dir=None, vmin=None, vmax=None):
+    """Plot 6 heatmaps (one per category) from a parsed prob-experiment data dict.
+
+    All 6 plots share the same colormap range so cells are directly comparable.
+
+    Parameters
+    ----------
+    data       : dict from :func:`parse_prob_file`
+    cmap       : matplotlib colormap name
+    output_dir : directory to save PNGs; display interactively if None
+    vmin, vmax : colormap bounds; default to global min/max across all categories
+    """
+    if vmin is None or vmax is None:
+        all_vals = [v for entry in [data['base']] + list(data['variants'].values())
+                    for v, _, _ in entry.values()]
+        if vmin is None:
+            vmin = min(all_vals)
+        if vmax is None:
+            vmax = max(all_vals)
+
+    out_dir = Path(output_dir) if output_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    for cat, sub in _PROB_CATEGORIES:
+        key   = f'{cat}/{sub}'
+        title = _PROB_TITLES[(cat, sub)]
+        fname = f'prob_{cat}_{sub}.png'
+        out_path = str(out_dir / fname) if out_dir else None
+        _plot_prob_heatmap(data, key, title, cmap, out_path, vmin, vmax)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -617,6 +829,10 @@ def main():
         help='Display values as percentages instead of [0, 1] (default: false)',
     )
     parser.add_argument(
+        '--prob-file', default=None, metavar='FILE',
+        help='Prob-experiment output file (prob_iti_output2.txt format) for 6-category heatmaps',
+    )
+    parser.add_argument(
         '--truth-acc', default=None, metavar='FILE',
         help='Truth probe accuracy matrix file for scatter plot',
     )
@@ -649,6 +865,22 @@ def main():
         return str(out_dir / name) if out_dir else None
 
     percentage = args.percent == 'true'
+
+    # --- Prob-experiment heatmap mode ---
+    if args.prob_file:
+        prob_data = parse_prob_file(args.prob_file)
+        print(f"Model:    {prob_data['model']}")
+        print(f"ks:       {prob_data['ks']}")
+        print(f"alphas:   {prob_data['alphas']}")
+        print(f"Variants: {len(prob_data['variants'])}")
+        plot_prob_heatmaps(
+            prob_data,
+            cmap=args.cmap,
+            output_dir=args.output_dir,
+            vmin=args.vmin,
+            vmax=args.vmax,
+        )
+        return
 
     # --- Scatter plot mode ---
     if args.truth_acc or args.context_acc:
