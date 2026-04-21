@@ -85,6 +85,110 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False, 
                     dataset_no_answer.append(prompt_template_na.format(context=data['parametric_memory_aligned_evidence'], query=data['question'], corr_answer=data['memory_answer']))
                     dataset_no_answer.append(prompt_template_na.format(context=data['counter_memory_aligned_evidence'], query=data['question'], corr_answer=data['counter_answer']))
                     dataset_no_answer.append(f"Question: {data['question']}\n")
+    elif dataset_model == 'time_qa':
+        import ast
+        import datasets as hf_datasets
+        from collections import defaultdict
+        _TIMEQA_CONTEXT_LIMIT = 2000
+        split = "train" if not second_dict else "validation"
+        _timeqa_local = dataset_path or '../TimeQA'
+        if os.path.isdir(_timeqa_local):
+            ds = hf_datasets.load_from_disk(_timeqa_local)
+            if hasattr(ds, 'keys'):  # DatasetDict — pick the right split
+                ds = ds[split]
+        else:
+            ds = hf_datasets.load_dataset("hugosousa/TimeQA", split=split)
+        # targets is stored as a stringified Python list in this HF mirror
+        def _parse_targets(raw):
+            if isinstance(raw, list):
+                return raw
+            try:
+                parsed = ast.literal_eval(raw)
+                return parsed if isinstance(parsed, list) else [str(parsed)]
+            except Exception:
+                return [str(raw)]
+        answerable = [x for x in ds if _parse_targets(x["targets"])]
+        rng = random.Random(42)
+        rng.shuffle(answerable)
+        if len(answerable) > dataset_size:
+            answerable = answerable[:dataset_size]
+
+        groups = defaultdict(list)
+        for item in answerable:
+            groups[item["idx"]].append(item)
+
+        prompt_template = "{context}\n\n{query}\n\n{response}\n"
+        prompt_template_na = (
+            "Here is some confirmed evidence, don't go doubting it.\n{context}\n"
+            "Please answer the question based solely on the evidence above in one short sentence.\n"
+            "Question: {query}\n"
+        )
+
+        n_genuine_conflicts = 0
+        for item in answerable:
+            context = item["context"][:_TIMEQA_CONTEXT_LIMIT]
+            query = item["question"]
+            answer = _parse_targets(item["targets"])[0]
+
+            conflicts = [x for x in groups[item["idx"]] if _parse_targets(x["targets"])[0] != answer]
+            if conflicts:
+                conflict = rng.choice(conflicts)
+                n_genuine_conflicts += 1
+            else:
+                conflict = rng.choice(answerable)
+                while conflict is item:
+                    conflict = rng.choice(answerable)
+
+            conf_context = conflict["context"][:_TIMEQA_CONTEXT_LIMIT]
+            conf_answer = _parse_targets(conflict["targets"])[0]
+
+            if not second_dict:
+                dataset.append({'query': prompt_template.format(context=context, query=query, response=answer), 'label': 1})
+                dataset.append({'query': prompt_template.format(context=conf_context, query=query, response=answer), 'label': 0})
+                dataset_no_answer.append(prompt_template_na.format(context=context, query=query))
+            else:
+                dataset_no_answer.append({'context': context, 'query': query, 'corr_answer': answer})
+                if conflicts:
+                    dataset_no_answer.append({'context': conf_context, 'query': query, 'corr_answer': conf_answer})
+
+        print(f"TimeQA: {n_genuine_conflicts}/{len(answerable)} records have genuine temporal conflict pairs")
+    elif dataset_model == 'squad_v2':
+        import datasets as hf_datasets
+        _squad_local = dataset_path or '../SQuAD_v2'
+        if os.path.isdir(_squad_local):
+            ds = hf_datasets.load_from_disk(_squad_local)
+            if hasattr(ds, 'keys'):  # DatasetDict — pick validation split
+                ds = ds['validation']
+        else:
+            ds = hf_datasets.load_dataset("rajpurkar/squad_v2", split="validation")
+        answerable = [x for x in ds if x["answers"]["text"]]
+        rng = random.Random(42)
+        rng.shuffle(answerable)
+        if len(answerable) > dataset_size:
+            answerable = answerable[:dataset_size]
+
+        # Rotate by 1 to produce mismatched context pairs for label=0 training examples
+        shuffled = answerable[1:] + [answerable[0]]
+
+        prompt_template = "{context}\n\n{query}\n\n{response}\n"
+        prompt_template_na = (
+            "Here is some confirmed evidence, don't go doubting it.\n{context}\n"
+            "Please answer the question based solely on the evidence above in one short sentence.\n"
+            "Question: {query}\n"
+        )
+
+        for item, conflict_item in zip(answerable, shuffled):
+            context = item["context"]
+            query = item["question"]
+            answer = item["answers"]["text"][0]
+            conf_context = conflict_item["context"]
+
+            if not second_dict:
+                dataset.append({'query': prompt_template.format(context=context, query=query, response=answer), 'label': 1})
+                dataset.append({'query': prompt_template.format(context=conf_context, query=query, response=answer), 'label': 0})
+                dataset_no_answer.append(prompt_template_na.format(context=context, query=query))
+            else:
+                dataset_no_answer.append({'context': context, 'query': query, 'corr_answer': answer})
     else:
         # TruthfulQA dataset
         random.seed(42)
@@ -1113,6 +1217,52 @@ def _load_explicit_model(model_path, fallback_tokenizer_name, quantize):
     return model, tokenizer
 
 
+def _load_iti_model(path):
+    """Load a saved ITI model, explicitly applying the saved o_proj biases.
+
+    Loads with attention_bias=False to prevent HuggingFace from creating bias
+    parameters for all projections (q/k/v/o) on all layers — most of which are
+    absent from the checkpoint and would be spuriously initialized. Then the
+    saved o_proj biases are applied directly to the appropriate layers.
+    """
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(path)
+    config.attention_bias = False
+    model = AutoModelForCausalLM.from_pretrained(path, config=config, device_map="cuda",
+                                                  torch_dtype=ch.bfloat16)
+
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    single_shard = os.path.join(path, "model.safetensors")
+
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        bias_by_shard = {}
+        for key, shard_file in weight_map.items():
+            if "o_proj.bias" in key:
+                bias_by_shard.setdefault(shard_file, []).append(key)
+    elif os.path.exists(single_shard):
+        bias_by_shard = {"model.safetensors": []}
+        from safetensors import safe_open
+        with safe_open(single_shard, framework="pt") as f:
+            bias_by_shard["model.safetensors"] = [k for k in f.keys() if "o_proj.bias" in k]
+    else:
+        return model
+
+    from safetensors.torch import load_file
+    n_applied = 0
+    for shard_file, keys in bias_by_shard.items():
+        tensors = load_file(os.path.join(path, shard_file))
+        for key in keys:
+            layer_idx = int(key.split(".")[2])
+            target_device = model.model.layers[layer_idx].self_attn.o_proj.weight.device
+            bias = tensors[key].to(target_device).to(ch.bfloat16)
+            model.model.layers[layer_idx].self_attn.o_proj.bias = ch.nn.Parameter(bias)
+            n_applied += 1
+    print(f"Applied ITI o_proj biases to {n_applied} layer(s)")
+    return model
+
+
 def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models",
                      quantize=True, dataset_path=None,
                      judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
@@ -1176,7 +1326,7 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             if not os.path.exists(variant):
                 print(f"Skipping {variant} (not found)")
                 continue
-            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
+            variant_model = _load_iti_model(variant)
             label = f"{model_name}_top_{k}_alpha_{alpha}"
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
                 variant_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
@@ -1512,7 +1662,7 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
             if not os.path.exists(variant):
                 print(f"Skipping {variant} (not found)")
                 continue
-            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
+            variant_model = _load_iti_model(variant)
             label = f"{model_name}_top_{k}_alpha_{alpha}"
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
                 variant_model, tokenizer, dataset_path, num_tests, quantize=quantize,
@@ -1772,6 +1922,105 @@ def _split_sentences(text):
     return parts if len(parts) >= 2 else [text.strip()]
 
 
+def build_prob_experiment_dataset(dataset_path, dataset_size, seed=42):
+    entries = []
+    with open(dataset_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    random.seed(seed)
+    random.shuffle(entries)
+    entries = entries[:dataset_size]
+
+    instances = []
+    for entry in entries:
+        q = entry["question"]
+        mem_ans = entry["memory_answer"]
+        ctr_ans = entry["counter_answer"]
+        mem_ctx = entry["parametric_memory_aligned_evidence"]
+        ctr_ctx = entry["counter_memory_aligned_evidence"]
+
+        for category, answer, match_ctx, nonmatch_ctx in [
+            ("true",  mem_ans, mem_ctx, ctr_ctx),
+            ("false", ctr_ans, ctr_ctx, mem_ctx),
+        ]:
+            instances.append({"category": category, "subcategory": "matching",     "context": match_ctx,    "question": q, "answer": answer})
+            instances.append({"category": category, "subcategory": "non_matching", "context": nonmatch_ctx, "question": q, "answer": answer})
+            instances.append({"category": category, "subcategory": "no_context",   "context": "",           "question": q, "answer": answer})
+    return instances
+
+
+def score_model_on_prob_dataset(model, tokenizer, instances):
+    results = []
+    for inst in instances:
+        answer_ids = tokenizer(inst["answer"], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        token_lps = _response_token_log_probs(model, tokenizer, inst["question"], inst["context"], answer_ids)
+        record = dict(inst)
+        record["mean_log_prob"] = float(token_lps.mean())
+        results.append(record)
+    return results
+
+
+def run_prob_experiment(model_name, ks, alphas, dataset_size=500, models_dir="updated_models",
+                        output_dir=None, quantize=True, dataset_path=None, seed=42,
+                        bootstrap_iters=1000):
+    dataset_path = dataset_path or "../PopQA/conflictQA-popQA-chatgpt.json"
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    instances = build_prob_experiment_dataset(dataset_path, dataset_size, seed=seed)
+    print(f"Built dataset: {len(instances)} instances ({dataset_size} entries × 6 categories)")
+
+    col_keys = [
+        ("true",  "matching"), ("true",  "non_matching"), ("true",  "no_context"),
+        ("false", "matching"), ("false", "non_matching"), ("false", "no_context"),
+    ]
+
+    def _evaluate(model, label):
+        t0 = time.time()
+        results = score_model_on_prob_dataset(model, tokenizer, instances)
+        elapsed = time.time() - t0
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe = label.replace('/', '_').replace(' ', '_')
+        filename = f"prob_experiment_{safe}_{ts}.jsonl"
+        out_path = os.path.join(output_dir, filename) if output_dir else filename
+        with open(out_path, 'w') as f:
+            for r in results:
+                f.write(json.dumps(r) + '\n')
+
+        groups = {}
+        for r in results:
+            groups.setdefault((r["category"], r["subcategory"]), []).append(r["mean_log_prob"])
+
+        parts = []
+        for cat, sub in col_keys:
+            mean, lo, hi = bootstrap_ci(groups[(cat, sub)], B=bootstrap_iters)
+            parts.append(f"{cat}/{sub}={mean:.3f} [{lo:.3f},{hi:.3f}]")
+        print(f"{label}  ({elapsed:.1f}s)")
+        print("  " + "  ".join(parts))
+        print(f"  → saved to {out_path}")
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+    _evaluate(model, model_name)
+    model.to('cpu')
+    del model
+    ch.cuda.empty_cache()
+
+    for k in ks:
+        for alpha in alphas:
+            variant = f"{models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_context"
+            if not os.path.exists(variant):
+                print(f"Skipping {variant} (not found)")
+                continue
+            variant_model = _load_iti_model(variant)
+            _evaluate(variant_model, f"{model_name}_top_{k}_alpha_{alpha}")
+            variant_model.to('cpu')
+            del variant_model
+            ch.cuda.empty_cache()
+
+
 def _rebuild_context(sources, mask):
     """Reconstruct context string from sentence sources and a binary mask."""
     return ' '.join(s for s, m in zip(sources, mask) if m)
@@ -1794,7 +2043,7 @@ def _response_token_log_probs(model, tokenizer, query, context, response_ids):
     # logit[i] predicts token[i+1]; response starts at prompt_len
     resp_logits = logits[0, prompt_len - 1: prompt_len - 1 + resp_len, :]
     log_probs = ch.log_softmax(resp_logits, dim=-1)
-    token_lps = log_probs[ch.arange(resp_len), response_ids[0].cpu()].cpu().numpy()
+    token_lps = log_probs[ch.arange(resp_len), response_ids[0].cpu()].float().cpu().numpy()
     return token_lps
 
 
@@ -2045,7 +2294,7 @@ def build_parser():
 
     # Shared arguments
     model_kwargs = dict(default="meta-llama/Meta-Llama-3-8B-Instruct", help="HuggingFace model ID")
-    dataset_kwargs = dict(choices=["ms_marco", "pop_qa", "truthQA"], default="pop_qa")
+    dataset_kwargs = dict(choices=["ms_marco", "pop_qa", "truthQA", "time_qa", "squad_v2"], default="pop_qa")
     ks_kwargs = dict(type=int, nargs="+", default=[16, 32, 48, 64, 80, 96], metavar="K", help="Top-k heads to intervene on")
     alphas_kwargs = dict(type=float, nargs="+", default=[2, 5, 7, 10], metavar="ALPHA", help="Intervention strength multipliers")
     quantize_kwargs = dict(action="store_true", dest="no_quantize", help="Load model in full precision (no 4-bit quantization)")
@@ -2285,6 +2534,21 @@ def build_parser():
                    help="Path to write per-sample JSONL results")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
+    # --- prob-experiment ---
+    p = subparsers.add_parser("prob-experiment", help="Measure answer log-probabilities across 6 context/answer categories.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset-path", default="../PopQA/conflictQA-popQA-chatgpt.json",
+                   help="Path to ConflictQA JSONL dataset")
+    p.add_argument("--dataset-size", type=int, default=500,
+                   help="Number of ConflictQA entries to sample")
+    p.add_argument("--ks", **ks_kwargs)
+    p.add_argument("--alphas", **alphas_kwargs)
+    p.add_argument("--models-dir", default="updated_models")
+    p.add_argument("--output-dir", default=None, help="Directory to save per-model result JSONL files")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
     return parser
 
 
@@ -2394,6 +2658,20 @@ def main():
             quantize=quantize,
             dataset_path=args.dataset_path,
             output_file=args.output_file,
+        )
+
+    elif args.mode == "prob-experiment":
+        run_prob_experiment(
+            model_name=args.model,
+            ks=args.ks,
+            alphas=args.alphas,
+            dataset_size=args.dataset_size,
+            models_dir=args.models_dir,
+            output_dir=args.output_dir,
+            quantize=quantize,
+            dataset_path=args.dataset_path,
+            seed=args.seed,
+            bootstrap_iters=args.bootstrap_iters,
         )
 
 
