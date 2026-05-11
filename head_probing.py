@@ -934,8 +934,8 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
 
     for idx, row in enumerate(dataset):
         query = (
-            f"{row['context']}\n"
-            f"Please answer the question in one short sentence.\n"
+            f"Here is some confirmed context information:\n{row['context']}\n"
+            f"Please answer the question based solely on the context above in one short sentence.\n"
             f"Question: {row['query']}\n"
         )
         prompt = tokenizer.apply_chat_template(
