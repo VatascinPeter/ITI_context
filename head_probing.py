@@ -1268,7 +1268,7 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
                      judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                      bootstrap_iters=1000, prompt_variant_check=False, variant_subset=50, seed=42,
                      output_dir=None, explicit_models=None, quantize_judge=None,
-                     hf_judge_info_model=None):
+                     hf_judge_info_model=None, lora_adapter=None):
     """Evaluate context-following on the base model and all intervened variants.
 
     If ``explicit_models`` is provided (a list of model paths), only those models
@@ -1335,6 +1335,22 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             )
             # variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+
+    if lora_adapter:
+        if not os.path.exists(lora_adapter):
+            print(f"LoRA adapter not found: {lora_adapter}")
+        else:
+            from peft import PeftModel
+            base_model = get_model_only(model_name, quantize=quantize)
+            lora_model = PeftModel.from_pretrained(base_model, lora_adapter)
+            lora_model = lora_model.merge_and_unload()
+            label = f"lora_{os.path.basename(lora_adapter.rstrip('/'))}"
+            (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
+                lora_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
+                judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
+                model_label=label, seed=seed, results_file=_results_path(label), **judge_kwargs,
+            )
+            print(f"LoRA ({lora_adapter}) — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
 
 
 def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=1000):
@@ -2065,7 +2081,7 @@ def _probe_context_score(model, tokenizer, query, context, response_ids, probes,
         def _make_hook(l, h):
             def _hook(module, inp, out):
                 x = inp[0][0, -1, :].detach()   # last token, [hidden]
-                head_acts[(l, h)] = x.view(num_heads, head_dim)[h].cpu().numpy()
+                head_acts[(l, h)] = x.view(num_heads, head_dim)[h].float().cpu().numpy()
             return _hook
         hooks.append(
             model.model.layers[layer_idx].self_attn.o_proj.register_forward_hook(_make_hook(layer_idx, head_idx))
@@ -2084,6 +2100,116 @@ def _probe_context_score(model, tokenizer, query, context, response_ids, probes,
         probe = probes[layer_idx][head_idx]
         scores.append(float(probe.predict_proba(act)[0, 1]))
     return float(np.mean(scores)) if scores else 0.0
+
+
+def _probe_answer_score(model, tokenizer, query, context, response_ids, probes, top_heads, accuracies):
+    """Return mean probe P(context-following) averaged over all answer tokens and top heads (accuracy-weighted)."""
+    num_heads = model.config.num_attention_heads
+    head_dim = model.config.hidden_size // num_heads
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": (
+            f"Here is some confirmed context information:\n{context}\n"
+            f"Please answer the question based solely on the context above in one short sentence.\n"
+            f"Question: {query}\n"
+        )}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    resp_len = response_ids.shape[1]
+    full_ids = ch.cat([prompt_ids, response_ids.cpu()], dim=1).to('cuda')
+    prompt_len = prompt_ids.shape[1]
+
+    head_acts = {}
+    hooks = []
+    for (layer_idx, head_idx) in top_heads:
+        def _make_hook(l, h):
+            def _hook(module, inp, out):
+                x = inp[0][0, prompt_len:prompt_len + resp_len, :].detach()  # [resp_len, hidden]
+                head_acts[(l, h)] = x.view(resp_len, num_heads, head_dim)[:, h, :].float().cpu().numpy()
+            return _hook
+        hooks.append(model.model.layers[layer_idx].self_attn.o_proj.register_forward_hook(_make_hook(layer_idx, head_idx)))
+
+    with ch.no_grad():
+        model(full_ids)
+    for h in hooks:
+        h.remove()
+
+    total_score = 0.0
+    total_weight = 0.0
+    for (layer_idx, head_idx) in top_heads:
+        if (layer_idx, head_idx) not in head_acts:
+            continue
+        acts = head_acts[(layer_idx, head_idx)]  # [resp_len, head_dim]
+        proba = probes[layer_idx][head_idx].predict_proba(acts)[:, 1]  # [resp_len]
+        w = float(accuracies[layer_idx][head_idx])
+        total_score += float(proba.mean()) * w
+        total_weight += w
+    return total_score / total_weight if total_weight > 0 else 0.0
+
+
+def score_model_on_probe_dataset(model, tokenizer, instances, probes, accuracies, top_k=16):
+    top_heads = get_top_k_heads(accuracies, top_k)
+    results = []
+    for inst in instances:
+        response_ids = tokenizer(inst["answer"], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        score = _probe_answer_score(model, tokenizer, inst["question"], inst["context"], response_ids, probes, top_heads, accuracies)
+        record = dict(inst)
+        record["mean_probe_score"] = score
+        results.append(record)
+    return results
+
+
+def run_probe_score_experiment(model_name, probes_path, accuracies_path,
+                                dataset_size=500, top_ks=(16,), output_dir=None,
+                                quantize=True, dataset_path=None, seed=42,
+                                bootstrap_iters=1000):
+    dataset_path = dataset_path or "../PopQA/conflictQA-popQA-chatgpt.json"
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    instances = build_prob_experiment_dataset(dataset_path, dataset_size, seed=seed)
+    print(f"Built dataset: {len(instances)} instances ({dataset_size} entries × 6 categories)")
+
+    with open(probes_path, "rb") as f:
+        probes = pickle.load(f)
+    accuracies = []
+    with open(accuracies_path, "r") as f:
+        for line in f:
+            accuracies.append(list(map(float, line.split())))
+    accuracies = np.array(accuracies)
+
+    col_keys = [
+        ("true",  "matching"), ("true",  "non_matching"), ("true",  "no_context"),
+        ("false", "matching"), ("false", "non_matching"), ("false", "no_context"),
+    ]
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+
+    for top_k in top_ks:
+        t0 = time.time()
+        results = score_model_on_probe_dataset(model, tokenizer, instances, probes, accuracies, top_k=top_k)
+        elapsed = time.time() - t0
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe = model_name.replace('/', '_').replace(' ', '_')
+        filename = f"probe_score_experiment_{safe}_top{top_k}_{ts}.jsonl"
+        out_path = os.path.join(output_dir, filename) if output_dir else filename
+        with open(out_path, 'w') as f:
+            for r in results:
+                f.write(json.dumps(r) + '\n')
+
+        groups = {}
+        for r in results:
+            groups.setdefault((r["category"], r["subcategory"]), []).append(r["mean_probe_score"])
+
+        parts = []
+        for cat, sub in col_keys:
+            mean, lo, hi = bootstrap_ci(groups[(cat, sub)], B=bootstrap_iters)
+            parts.append(f"{cat}/{sub}={mean:.3f} [{lo:.3f},{hi:.3f}]")
+        print(f"{model_name} top_k={top_k}  ({elapsed:.1f}s)")
+        print("  " + "  ".join(parts))
+        print(f"  → saved to {out_path}")
 
 
 def _fit_linear(masks, scores):
@@ -2347,6 +2473,8 @@ def build_parser():
     p.add_argument("--output-dir", default=None, help="Directory to save results JSONL files (default: current directory)")
     p.add_argument("--models", nargs="+", default=None, metavar="MODEL_PATH",
                    help="Explicit model paths to evaluate. When set, skips the base model and k/alpha sweep.")
+    p.add_argument("--lora-adapter", default=None, metavar="PATH",
+                   help="Path to a LoRA adapter directory. The adapter is merged into the base model and evaluated after the k/alpha sweep.")
     p.add_argument("--no-quantize", **quantize_kwargs)
     p.add_argument("--no-quantize-judge", action="store_true", dest="no_quantize_judge",
                    help="Load the judge model in full precision regardless of --no-quantize")
@@ -2549,6 +2677,21 @@ def build_parser():
     p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
+    # --- probe-score-experiment ---
+    p = subparsers.add_parser("probe-score-experiment", help="Measure mean probe attribution score across 6 context/answer categories (base model only).")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--probes", default="probes.pkl", help="Path to probes .pkl file")
+    p.add_argument("--accuracies", default=None, help="Path to accuracies .txt file (default: auto-detect from model name)")
+    p.add_argument("--dataset-path", default="../PopQA/conflictQA-popQA-chatgpt.json",
+                   help="Path to ConflictQA JSONL dataset")
+    p.add_argument("--dataset-size", type=int, default=500,
+                   help="Number of ConflictQA entries to sample")
+    p.add_argument("--top-k", type=int, nargs="+", default=[16], dest="top_k", metavar="K", help="Number of top probe heads to use for attribution (one run per value)")
+    p.add_argument("--output-dir", default=None, help="Directory to save result JSONL file")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
     return parser
 
 
@@ -2576,7 +2719,8 @@ def main():
                          prompt_variant_check=args.prompt_variant_check, variant_subset=args.variant_subset,
                          seed=args.seed, output_dir=args.output_dir, explicit_models=args.models,
                          quantize_judge=quantize_judge,
-                         hf_judge_info_model=args.hf_judge_info_model)
+                         hf_judge_info_model=args.hf_judge_info_model,
+                         lora_adapter=args.lora_adapter)
 
     elif args.mode == "rejudge":
         run_rejudge(args.jsonl_files, args.judge_model, quantize=quantize, bootstrap_iters=args.bootstrap_iters)
@@ -2667,6 +2811,21 @@ def main():
             alphas=args.alphas,
             dataset_size=args.dataset_size,
             models_dir=args.models_dir,
+            output_dir=args.output_dir,
+            quantize=quantize,
+            dataset_path=args.dataset_path,
+            seed=args.seed,
+            bootstrap_iters=args.bootstrap_iters,
+        )
+
+    elif args.mode == "probe-score-experiment":
+        acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
+        run_probe_score_experiment(
+            model_name=args.model,
+            probes_path=args.probes,
+            accuracies_path=acc_path,
+            dataset_size=args.dataset_size,
+            top_ks=args.top_k,
             output_dir=args.output_dir,
             quantize=quantize,
             dataset_path=args.dataset_path,
