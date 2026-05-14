@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import pickle
 import shutil
@@ -836,6 +837,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
             record["decision_truthful"]     = decision
         truth_jmodel.to('cpu')
         del truth_jmodel
+        gc.collect()
         ch.cuda.empty_cache()
 
         info_jmodel, info_jtok = get_truthfulqa_judge(hf_judge_info_model)
@@ -849,6 +851,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
             record["decision_informative"]     = decision
         info_jmodel.to('cpu')
         del info_jmodel
+        gc.collect()
         ch.cuda.empty_cache()
 
     elif use_gpt_judge:
@@ -895,6 +898,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
                 record[f"rationale_{key}"] = rationale
                 record[f"decision_{key}"] = decision
         del judge_model
+        gc.collect()
         ch.cuda.empty_cache()
 
     if results_file is None:
@@ -1023,6 +1027,7 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
         print()
 
     del judge_model
+    gc.collect()
     ch.cuda.empty_cache()
 
     # --- Informative axis: HF judge (logprob) or same regular judge ---
@@ -1039,6 +1044,7 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
             record["decision_informative"]     = decision
         info_jmodel.to('cpu')
         del info_jmodel
+        gc.collect()
         ch.cuda.empty_cache()
     else:
         judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
@@ -1062,6 +1068,7 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
             record["rationale_informative"]    = rationale
             record["decision_informative"]     = decision
         del judge_model
+        gc.collect()
         ch.cuda.empty_cache()
 
     # Strip internal field before saving
@@ -1426,6 +1433,7 @@ def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=10
         print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
 
     del judge_model
+    gc.collect()
     ch.cuda.empty_cache()
 
 
@@ -1482,6 +1490,7 @@ def run_rejudge_info(jsonl_files, hf_judge_info_model, bootstrap_iters=1000):
         print(f"{label} — context*info: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  info: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
 
     del info_jmodel
+    gc.collect()
     ch.cuda.empty_cache()
 
 
@@ -1551,6 +1560,7 @@ def run_rejudge_context(jsonl_files, judge_model_name, quantize=True, bootstrap_
         print(f"{label} — context*info: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  info: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
 
     del judge_model
+    gc.collect()
     ch.cuda.empty_cache()
 
 
@@ -2022,6 +2032,7 @@ def run_prob_experiment(model_name, ks, alphas, dataset_size=500, models_dir="up
     _evaluate(model, model_name)
     model.to('cpu')
     del model
+    gc.collect()
     ch.cuda.empty_cache()
 
     for k in ks:
@@ -2034,6 +2045,7 @@ def run_prob_experiment(model_name, ks, alphas, dataset_size=500, models_dir="up
             _evaluate(variant_model, f"{model_name}_top_{k}_alpha_{alpha}")
             variant_model.to('cpu')
             del variant_model
+            gc.collect()
             ch.cuda.empty_cache()
 
 
@@ -2163,7 +2175,7 @@ def score_model_on_probe_dataset(model, tokenizer, instances, probes, accuracies
 def run_probe_score_experiment(model_name, probes_path, accuracies_path,
                                 dataset_size=500, top_ks=(16,), output_dir=None,
                                 quantize=True, dataset_path=None, seed=42,
-                                bootstrap_iters=1000):
+                                bootstrap_iters=1000, top_bottom_n=100):
     dataset_path = dataset_path or "../PopQA/conflictQA-popQA-chatgpt.json"
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
@@ -2209,6 +2221,21 @@ def run_probe_score_experiment(model_name, probes_path, accuracies_path,
             parts.append(f"{cat}/{sub}={mean:.3f} [{lo:.3f},{hi:.3f}]")
         print(f"{model_name} top_k={top_k}  ({elapsed:.1f}s)")
         print("  " + "  ".join(parts))
+
+        if top_bottom_n > 0:
+            top_parts, bot_parts = [], []
+            for cat, sub in col_keys:
+                scores = sorted(groups[(cat, sub)], reverse=True)
+                top_scores = scores[:top_bottom_n]
+                bot_scores = scores[-top_bottom_n:]
+                t_mean, t_lo, t_hi = bootstrap_ci(top_scores, B=bootstrap_iters)
+                b_mean, b_lo, b_hi = bootstrap_ci(bot_scores, B=bootstrap_iters)
+                top_parts.append(f"{cat}/{sub}={t_mean:.3f} [{t_lo:.3f},{t_hi:.3f}]")
+                bot_parts.append(f"{cat}/{sub}={b_mean:.3f} [{b_lo:.3f},{b_hi:.3f}]")
+            actual_n = min(top_bottom_n, min(len(v) for v in groups.values()))
+            print(f"  top-{actual_n}: " + "  ".join(top_parts))
+            print(f"  bot-{actual_n}: " + "  ".join(bot_parts))
+
         print(f"  → saved to {out_path}")
 
 
@@ -2403,6 +2430,7 @@ def run_attribution_experiment(
         print(f"\nPer-sample results saved to {output_file}")
 
     del model
+    gc.collect()
     ch.cuda.empty_cache()
     return all_results
 
@@ -2690,6 +2718,8 @@ def build_parser():
     p.add_argument("--output-dir", default=None, help="Directory to save result JSONL file")
     p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling")
     p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--top-bottom-n", type=int, default=100, dest="top_bottom_n",
+                   help="Report stats for top-N and bottom-N results per group (0 to disable)")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
     return parser
@@ -2831,6 +2861,7 @@ def main():
             dataset_path=args.dataset_path,
             seed=args.seed,
             bootstrap_iters=args.bootstrap_iters,
+            top_bottom_n=args.top_bottom_n,
         )
 
 
