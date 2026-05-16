@@ -1,10 +1,10 @@
 import argparse
+import gc
 import os
 import pickle
 import shutil
 import time
 import json
-import pyvene as pv
 import re
 import csv
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -86,6 +86,110 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False, 
                     dataset_no_answer.append(prompt_template_na.format(context=data['parametric_memory_aligned_evidence'], query=data['question'], corr_answer=data['memory_answer']))
                     dataset_no_answer.append(prompt_template_na.format(context=data['counter_memory_aligned_evidence'], query=data['question'], corr_answer=data['counter_answer']))
                     dataset_no_answer.append(f"Question: {data['question']}\n")
+    elif dataset_model == 'time_qa':
+        import ast
+        import datasets as hf_datasets
+        from collections import defaultdict
+        _TIMEQA_CONTEXT_LIMIT = 2000
+        split = "train" if not second_dict else "validation"
+        _timeqa_local = dataset_path or '../TimeQA'
+        if os.path.isdir(_timeqa_local):
+            ds = hf_datasets.load_from_disk(_timeqa_local)
+            if hasattr(ds, 'keys'):  # DatasetDict — pick the right split
+                ds = ds[split]
+        else:
+            ds = hf_datasets.load_dataset("hugosousa/TimeQA", split=split)
+        # targets is stored as a stringified Python list in this HF mirror
+        def _parse_targets(raw):
+            if isinstance(raw, list):
+                return raw
+            try:
+                parsed = ast.literal_eval(raw)
+                return parsed if isinstance(parsed, list) else [str(parsed)]
+            except Exception:
+                return [str(raw)]
+        answerable = [x for x in ds if _parse_targets(x["targets"])]
+        rng = random.Random(42)
+        rng.shuffle(answerable)
+        if len(answerable) > dataset_size:
+            answerable = answerable[:dataset_size]
+
+        groups = defaultdict(list)
+        for item in answerable:
+            groups[item["idx"]].append(item)
+
+        prompt_template = "{context}\n\n{query}\n\n{response}\n"
+        prompt_template_na = (
+            "Here is some confirmed evidence, don't go doubting it.\n{context}\n"
+            "Please answer the question based solely on the evidence above in one short sentence.\n"
+            "Question: {query}\n"
+        )
+
+        n_genuine_conflicts = 0
+        for item in answerable:
+            context = item["context"][:_TIMEQA_CONTEXT_LIMIT]
+            query = item["question"]
+            answer = _parse_targets(item["targets"])[0]
+
+            conflicts = [x for x in groups[item["idx"]] if _parse_targets(x["targets"])[0] != answer]
+            if conflicts:
+                conflict = rng.choice(conflicts)
+                n_genuine_conflicts += 1
+            else:
+                conflict = rng.choice(answerable)
+                while conflict is item:
+                    conflict = rng.choice(answerable)
+
+            conf_context = conflict["context"][:_TIMEQA_CONTEXT_LIMIT]
+            conf_answer = _parse_targets(conflict["targets"])[0]
+
+            if not second_dict:
+                dataset.append({'query': prompt_template.format(context=context, query=query, response=answer), 'label': 1})
+                dataset.append({'query': prompt_template.format(context=conf_context, query=query, response=answer), 'label': 0})
+                dataset_no_answer.append(prompt_template_na.format(context=context, query=query))
+            else:
+                dataset_no_answer.append({'context': context, 'query': query, 'corr_answer': answer})
+                if conflicts:
+                    dataset_no_answer.append({'context': conf_context, 'query': query, 'corr_answer': conf_answer})
+
+        print(f"TimeQA: {n_genuine_conflicts}/{len(answerable)} records have genuine temporal conflict pairs")
+    elif dataset_model == 'squad_v2':
+        import datasets as hf_datasets
+        _squad_local = dataset_path or '../SQuAD_v2'
+        if os.path.isdir(_squad_local):
+            ds = hf_datasets.load_from_disk(_squad_local)
+            if hasattr(ds, 'keys'):  # DatasetDict — pick validation split
+                ds = ds['validation']
+        else:
+            ds = hf_datasets.load_dataset("rajpurkar/squad_v2", split="validation")
+        answerable = [x for x in ds if x["answers"]["text"]]
+        rng = random.Random(42)
+        rng.shuffle(answerable)
+        if len(answerable) > dataset_size:
+            answerable = answerable[:dataset_size]
+
+        # Rotate by 1 to produce mismatched context pairs for label=0 training examples
+        shuffled = answerable[1:] + [answerable[0]]
+
+        prompt_template = "{context}\n\n{query}\n\n{response}\n"
+        prompt_template_na = (
+            "Here is some confirmed evidence, don't go doubting it.\n{context}\n"
+            "Please answer the question based solely on the evidence above in one short sentence.\n"
+            "Question: {query}\n"
+        )
+
+        for item, conflict_item in zip(answerable, shuffled):
+            context = item["context"]
+            query = item["question"]
+            answer = item["answers"]["text"][0]
+            conf_context = conflict_item["context"]
+
+            if not second_dict:
+                dataset.append({'query': prompt_template.format(context=context, query=query, response=answer), 'label': 1})
+                dataset.append({'query': prompt_template.format(context=conf_context, query=query, response=answer), 'label': 0})
+                dataset_no_answer.append(prompt_template_na.format(context=context, query=query))
+            else:
+                dataset_no_answer.append({'context': context, 'query': query, 'corr_answer': answer})
     else:
         # TruthfulQA dataset
         random.seed(42)
@@ -105,6 +209,94 @@ def get_dataset(dataset_model='ms_marco', dataset_size=1000, second_dict=False, 
     return dataset, dataset_no_answer
 
 
+def get_attribution_dataset(dataset_name, num_tests, seed=42):
+    """Load (query, context, response) triples for the attribution experiment.
+
+    Supports:
+    - ``hotpot_qa``   — HotpotQA distractor split (multi-hop, multi-paragraph contexts)
+    - ``tydiqa``      — TyDi QA primary task, English only (passage-based QA)
+    - ``cnn_dailymail`` — CNN/DailyMail (article → highlights summarisation)
+
+    Returns a list of dicts with keys ``query``, ``context``, ``corr_answer``.
+    """
+    import datasets as hf_datasets  # pip install datasets
+
+    rng = np.random.default_rng(seed)
+
+    if dataset_name == "hotpot_qa":
+        ds = hf_datasets.load_dataset("hotpot_qa", "distractor", split="validation", trust_remote_code=True)
+        indices = rng.choice(len(ds), size=min(num_tests, len(ds)), replace=False).tolist()
+        rows = []
+        for i in indices:
+            item = ds[int(i)]
+            # context: join all paragraphs (list of title + sentence lists)
+            paragraphs = []
+            for title, sentences in zip(item["context"]["title"], item["context"]["sentences"]):
+                paragraphs.append(f"{title}: {''.join(sentences)}")
+            context = " ".join(paragraphs)
+            rows.append({
+                "query": item["question"],
+                "context": context,
+                "corr_answer": item["answer"],
+            })
+        return rows
+
+    elif dataset_name == "tydiqa":
+        ds = hf_datasets.load_dataset("tydiqa", "primary_task", split="validation", trust_remote_code=True)
+        # Filter to English
+        en_ds = ds.filter(lambda x: x["id"].startswith("english"))
+        indices = rng.choice(len(en_ds), size=min(num_tests, len(en_ds)), replace=False).tolist()
+        rows = []
+        for i in indices:
+            item = en_ds[int(i)]
+            context = item["document_plaintext"]
+            # Truncate very long articles to first 2000 chars to keep GPU memory manageable
+            if len(context) > 2000:
+                context = context[:2000]
+            # Use the first minimal answer span if available
+            ann = item["annotations"]
+            answer = ""
+            for span in ann.get("minimal_answers", []):
+                text = span.get("plaintext", "").strip()
+                if text and text not in ("VOID", "YES", "NO"):
+                    answer = text
+                    break
+            if not answer:
+                # fall back to passage answer spans
+                for span in ann.get("passage_answer_candidate_index", []):
+                    pass  # no text field at this level — skip
+                continue  # skip samples with no extractable answer
+            rows.append({
+                "query": item["question_text"],
+                "context": context,
+                "corr_answer": answer,
+            })
+            if len(rows) >= num_tests:
+                break
+        return rows
+
+    elif dataset_name == "cnn_dailymail":
+        ds = hf_datasets.load_dataset("cnn_dailymail", "3.0.0", split="validation", trust_remote_code=True)
+        indices = rng.choice(len(ds), size=min(num_tests, len(ds)), replace=False).tolist()
+        rows = []
+        for i in indices:
+            item = ds[int(i)]
+            article = item["article"]
+            # Truncate very long articles
+            if len(article) > 3000:
+                article = article[:3000]
+            rows.append({
+                "query": "Summarize the following article.",
+                "context": article,
+                "corr_answer": item["highlights"],
+            })
+        return rows
+
+    else:
+        raise ValueError(f"Unknown attribution dataset: {dataset_name!r}. "
+                         f"Choose from: hotpot_qa, tydiqa, cnn_dailymail")
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
@@ -119,7 +311,14 @@ def get_model(model_name="huggyllama/llama-7b", quantize=True):
     n_gpus = ch.cuda.device_count()
     print(f"Detected {n_gpus} GPU(s) for model loading.")
     max_memory = {i: "35GiB" for i in range(n_gpus)} if n_gpus > 1 else None
-    model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", quantization_config=bnb_config, device_map="auto", max_memory=max_memory)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", quantization_config=bnb_config, device_map="auto", max_memory=max_memory)
+    except ValueError as e:
+        if "model_type" not in str(e):
+            raise
+        # Older LLaMA-1 repos omit model_type in config.json — load as LLaMA directly.
+        from transformers import LlamaForCausalLM
+        model = LlamaForCausalLM.from_pretrained(model_name, attn_implementation="eager", quantization_config=bnb_config, device_map="auto", max_memory=max_memory)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     return model, tokenizer
 
@@ -141,6 +340,7 @@ def get_model_only(model_name="huggyllama/llama-7b", quantize=True):
 # ---------------------------------------------------------------------------
 
 def get_pv_configs(model):
+    import pyvene as pv
     pv_configs = []
     for i in range(model.config.num_hidden_layers):
         pv_configs.append({
@@ -152,6 +352,7 @@ def get_pv_configs(model):
 
 
 def get_activations_dataset(model, tokenizer, dataset, pv_configs):
+    import pyvene as pv
     probing_dataset_X = []
     probing_dataset_Y = []
     pv_model = pv.IntervenableModel(pv_configs, model=model)
@@ -347,6 +548,7 @@ def print_colored_terminal(tokens, ratings):
 
 
 def generate_answer_context_rating(model, tokenizer, dataset, probes_path, accuracies_path, pv_configs=None, top_k=16):
+    import pyvene as pv
     if pv_configs is None:
         pv_configs = get_pv_configs(model)
     pv_model = pv.IntervenableModel(pv_configs, model=model)
@@ -635,6 +837,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
             record["decision_truthful"]     = decision
         truth_jmodel.to('cpu')
         del truth_jmodel
+        gc.collect()
         ch.cuda.empty_cache()
 
         info_jmodel, info_jtok = get_truthfulqa_judge(hf_judge_info_model)
@@ -648,6 +851,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
             record["decision_informative"]     = decision
         info_jmodel.to('cpu')
         del info_jmodel
+        gc.collect()
         ch.cuda.empty_cache()
 
     elif use_gpt_judge:
@@ -694,6 +898,7 @@ def truth_test(model, tokenizer, dataset_path, num_tests=10, quantize=True,
                 record[f"rationale_{key}"] = rationale
                 record[f"decision_{key}"] = decision
         del judge_model
+        gc.collect()
         ch.cuda.empty_cache()
 
     if results_file is None:
@@ -717,21 +922,24 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
                  judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                  results_file=None, bootstrap_iters=1000,
                  prompt_variant_check=False, variant_subset=50,
-                 model_label="", seed=42, quantize_judge=None):
+                 model_label="", seed=42, quantize_judge=None,
+                 hf_judge_info_model=None):
+    """Evaluate context-following of ``model`` on the given dataset.
+
+    The context axis always uses ``judge_model_name`` (regular LLM judge).
+    When ``hf_judge_info_model`` is provided, informativeness is judged by that
+    HF model via next-token logprob (same mechanism as truth_test), and the two
+    models are loaded sequentially to keep peak VRAM usage low.
+    """
     start = time.time()
     records = []
     random.seed(seed)
     _, dataset = get_dataset(dataset_name, num_tests, second_dict=True, dataset_path=dataset_path)
 
     for idx, row in enumerate(dataset):
-        # query = (
-        #     f"Here is some confirmed evidence, don't go doubting it.\n{row['context']}\n"
-        #     f"Please answer the question based solely on the evidence above in one short sentence.\n"
-        #     f"Question: {row['query']}\n"
-        # )
         query = (
-            f"{row['context']}\n"
-            f"Please answer the question in one short sentence.\n"
+            f"Here is some confirmed context information:\n{row['context']}\n"
+            f"Please answer the question based solely on the context above in one short sentence.\n"
             f"Question: {row['query']}\n"
         )
         prompt = tokenizer.apply_chat_template(
@@ -759,32 +967,30 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
 
     model.to('cpu')
     del model
+
+    # --- Context axis: regular LLM judge ---
     _qj = quantize_judge if quantize_judge is not None else quantize
     judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
 
     for record in records:
-        answer_str = record.pop("_answer_str")
-        record["judge_model"] = judge_model_name
-        for task_template, key in [
-            (_JUDGE_PROMPT_CONTEXT["A"], "context_A"),
-            (_JUDGE_PROMPT_INFORMATIVE, "informative"),
-        ]:
-            task = task_template.format(answer=answer_str)
-            jp = judge_tokenizer.apply_chat_template(
-                [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+        answer_str = record["_answer_str"]
+        record["judge_model_context"] = judge_model_name
+        task = _JUDGE_PROMPT_CONTEXT["A"].format(answer=answer_str)
+        jp = judge_tokenizer.apply_chat_template(
+            [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+        )
+        input_ids = judge_tokenizer(jp, return_tensors="pt").to('cuda')
+        with ch.no_grad():
+            output_ids = judge_model.generate(
+                **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
+                pad_token_id=judge_tokenizer.eos_token_id
             )
-            input_ids = judge_tokenizer(jp, return_tensors="pt").to('cuda')
-            with ch.no_grad():
-                output_ids = judge_model.generate(
-                    **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=judge_tokenizer.eos_token_id
-                )
-            raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
-            rationale, decision = _parse_judge_response(raw)
-            record[f"judge_prompt_{key}"] = task
-            record[f"judge_raw_{key}"] = raw
-            record[f"rationale_{key}"] = rationale
-            record[f"decision_{key}"] = decision
+        raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
+        rationale, decision = _parse_judge_response(raw)
+        record["judge_prompt_context_A"] = task
+        record["judge_raw_context_A"]    = raw
+        record["rationale_context_A"]    = rationale
+        record["decision_context_A"]     = decision
 
     if prompt_variant_check:
         subset = records[:min(variant_subset, len(records))]
@@ -820,6 +1026,55 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
             print(f"  Pearson r({v1},{v2}) = {corr:.3f}")
         print()
 
+    del judge_model
+    gc.collect()
+    ch.cuda.empty_cache()
+
+    # --- Informative axis: HF judge (logprob) or same regular judge ---
+    if hf_judge_info_model:
+        info_jmodel, info_jtok = get_truthfulqa_judge(hf_judge_info_model)
+        for record in records:
+            decision = _hf_judge_logprob_decision(
+                record["query"], record["response"], info_jmodel, info_jtok, "Helpful:"
+            )
+            record["judge_model_informative"]  = hf_judge_info_model
+            record["judge_prompt_informative"] = f"Q: {record['query']}\nA: {record['response']}\nHelpful:"
+            record["judge_raw_informative"]    = "yes" if decision else "no"
+            record["rationale_informative"]    = ""
+            record["decision_informative"]     = decision
+        info_jmodel.to('cpu')
+        del info_jmodel
+        gc.collect()
+        ch.cuda.empty_cache()
+    else:
+        judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
+        for record in records:
+            answer_str = record["_answer_str"]
+            record["judge_model_informative"] = judge_model_name
+            task = _JUDGE_PROMPT_INFORMATIVE.format(answer=answer_str)
+            jp = judge_tokenizer.apply_chat_template(
+                [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+            )
+            input_ids = judge_tokenizer(jp, return_tensors="pt").to('cuda')
+            with ch.no_grad():
+                output_ids = judge_model.generate(
+                    **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=judge_tokenizer.eos_token_id
+                )
+            raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
+            rationale, decision = _parse_judge_response(raw)
+            record["judge_prompt_informative"] = task
+            record["judge_raw_informative"]    = raw
+            record["rationale_informative"]    = rationale
+            record["decision_informative"]     = decision
+        del judge_model
+        gc.collect()
+        ch.cuda.empty_cache()
+
+    # Strip internal field before saving
+    for record in records:
+        record.pop("_answer_str", None)
+
     if results_file is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
         safe = (model_label or "base").replace('/', '_').replace(' ', '_')
@@ -833,8 +1088,6 @@ def context_test(model, tokenizer, dataset_name, num_tests=10, quantize=True, da
     decisions_info = [r["decision_informative"] for r in records]
     decisions_both = [a and b for a, b in zip(decisions_context, decisions_info)]
 
-    del judge_model
-    ch.cuda.empty_cache()
     print(f"Context test completed in {time.time() - start:.1f}s")
     print(f"Dataset size {len(dataset)}")
     return bootstrap_ci(decisions_both, B=bootstrap_iters), bootstrap_ci(decisions_context, B=bootstrap_iters), bootstrap_ci(decisions_info, B=bootstrap_iters)
@@ -894,8 +1147,42 @@ def run_train(model_name, dataset_name, ks, alphas, dataset_size=10000, output_d
             del model
 
 
+def _convert_bin_to_safetensors(model_path):
+    """Convert pytorch_model*.bin files in a directory to safetensors format in-place.
+
+    Called before loading pre-quantized local models whose weights were saved in the
+    old .bin format (before safe_serialization=True was added).  Transformers >=4.x
+    with torch <2.6 refuses to torch.load() these files due to CVE-2025-32434.
+    Direct torch.load() on our own generated files is safe.
+    """
+    target = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(target):
+        return  # already correct
+
+    # Rename leftover from a previous conversion that used the wrong output name
+    legacy_st = os.path.join(model_path, "pytorch_model.safetensors")
+    if os.path.exists(legacy_st):
+        os.rename(legacy_st, target)
+        print(f"Renamed pytorch_model.safetensors → model.safetensors in {model_path}", flush=True)
+        return
+
+    import glob as _glob
+    bin_files = sorted(_glob.glob(os.path.join(model_path, "*.bin")))
+    if not bin_files:
+        return
+    from safetensors.torch import save_file as _st_save
+    print(f"Converting {len(bin_files)} .bin file(s) in {model_path} to safetensors ...", flush=True)
+    merged = {}
+    for bin_file in bin_files:
+        merged.update(ch.load(bin_file, map_location="cpu", weights_only=False))
+    _st_save(merged, target)
+    for bin_file in bin_files:
+        os.remove(bin_file)
+    print("Conversion done.", flush=True)
+
+
 def _load_explicit_model(model_path, fallback_tokenizer_name, quantize):
-    """Load an explicit model for evaluation, handling two special cases:
+    """Load an explicit model for evaluation, handling three special cases:
 
     1. Pre-quantized local models (ITI variants saved from a quantized base):
        the config.json already contains a ``quantization_config``; passing a new
@@ -904,6 +1191,11 @@ def _load_explicit_model(model_path, fallback_tokenizer_name, quantize):
 
     2. No tokenizer files (ITI models only save weights): fall back to loading
        the tokenizer from ``fallback_tokenizer_name`` (the ``--model`` base model).
+       For HF model IDs (not local dirs) the tokenizer is always loaded from the
+       model itself; the fallback is only used for local weight-only directories.
+
+    3. Old .bin checkpoints: converted to safetensors in-place before loading to
+       avoid the CVE-2025-32434 torch.load block in recent transformers versions.
     """
     is_local_dir = os.path.isdir(model_path)
 
@@ -916,29 +1208,82 @@ def _load_explicit_model(model_path, fallback_tokenizer_name, quantize):
                 is_pre_quantized = json.load(f).get("quantization_config") is not None
 
     if is_pre_quantized:
+        _convert_bin_to_safetensors(model_path)
         model = AutoModelForCausalLM.from_pretrained(
             model_path, attn_implementation="eager", device_map="auto"
         )
     else:
         model, _ = get_model(model_path, quantize=quantize)
 
-    # Tokenizer: use the model's own if available, else fall back to base model
-    has_tokenizer = is_local_dir and os.path.exists(os.path.join(model_path, "tokenizer.json"))
+    # Tokenizer: for HF model IDs always use the model's own tokenizer.
+    # For local dirs without tokenizer files, fall back to the base model.
+    has_tokenizer = (not is_local_dir) or os.path.exists(os.path.join(model_path, "tokenizer.json"))
     tok_source = model_path if has_tokenizer else fallback_tokenizer_name
     tokenizer = AutoTokenizer.from_pretrained(tok_source)
 
     return model, tokenizer
 
 
+def _load_iti_model(path):
+    """Load a saved ITI model, explicitly applying the saved o_proj biases.
+
+    Loads with attention_bias=False to prevent HuggingFace from creating bias
+    parameters for all projections (q/k/v/o) on all layers — most of which are
+    absent from the checkpoint and would be spuriously initialized. Then the
+    saved o_proj biases are applied directly to the appropriate layers.
+    """
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(path)
+    config.attention_bias = False
+    model = AutoModelForCausalLM.from_pretrained(path, config=config, device_map="cuda",
+                                                  torch_dtype=ch.bfloat16)
+
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    single_shard = os.path.join(path, "model.safetensors")
+
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        bias_by_shard = {}
+        for key, shard_file in weight_map.items():
+            if "o_proj.bias" in key:
+                bias_by_shard.setdefault(shard_file, []).append(key)
+    elif os.path.exists(single_shard):
+        bias_by_shard = {"model.safetensors": []}
+        from safetensors import safe_open
+        with safe_open(single_shard, framework="pt") as f:
+            bias_by_shard["model.safetensors"] = [k for k in f.keys() if "o_proj.bias" in k]
+    else:
+        return model
+
+    from safetensors.torch import load_file
+    n_applied = 0
+    for shard_file, keys in bias_by_shard.items():
+        tensors = load_file(os.path.join(path, shard_file))
+        for key in keys:
+            layer_idx = int(key.split(".")[2])
+            target_device = model.model.layers[layer_idx].self_attn.o_proj.weight.device
+            bias = tensors[key].to(target_device).to(ch.bfloat16)
+            model.model.layers[layer_idx].self_attn.o_proj.bias = ch.nn.Parameter(bias)
+            n_applied += 1
+    print(f"Applied ITI o_proj biases to {n_applied} layer(s)")
+    return model
+
+
 def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_dir="updated_models",
                      quantize=True, dataset_path=None,
                      judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
                      bootstrap_iters=1000, prompt_variant_check=False, variant_subset=50, seed=42,
-                     output_dir=None, explicit_models=None, quantize_judge=None):
+                     output_dir=None, explicit_models=None, quantize_judge=None,
+                     hf_judge_info_model=None, lora_adapter=None):
     """Evaluate context-following on the base model and all intervened variants.
 
     If ``explicit_models`` is provided (a list of model paths), only those models
     are evaluated — the base-model run and the k/alpha sweep are skipped.
+
+    ``hf_judge_info_model`` optionally overrides the informative judge with a
+    dedicated HF model (same format as truth_test); the context judge always uses
+    ``judge_model_name``.
     """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
@@ -949,6 +1294,8 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
         filename = f"results_context_{safe}_{ts}.jsonl"
         return os.path.join(output_dir, filename) if output_dir else None
 
+    judge_kwargs = dict(quantize_judge=quantize_judge, hf_judge_info_model=hf_judge_info_model)
+
     if explicit_models:
         for model_path in explicit_models:
             is_hf_id = not os.path.isabs(model_path) and "/" in model_path and not os.path.exists(model_path)
@@ -956,12 +1303,15 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
                 print(f"Skipping {model_path} (not found)")
                 continue
             label = model_path
-            explicit_model, tokenizer = _load_explicit_model(model_path, model_name, quantize)
+            try:
+                explicit_model, tokenizer = _load_explicit_model(model_path, model_name, quantize)
+            except (OSError, ValueError) as e:
+                print(f"Skipping {model_path} (failed to load: {e})", flush=True)
+                continue
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
                 explicit_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
-                model_label=label, seed=seed, results_file=_results_path(label),
-                quantize_judge=quantize_judge,
+                model_label=label, seed=seed, results_file=_results_path(label), **judge_kwargs,
             )
             print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
         return
@@ -971,8 +1321,7 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
         model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
         judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
         prompt_variant_check=prompt_variant_check, variant_subset=variant_subset,
-        model_label=model_name, seed=seed, results_file=_results_path(model_name),
-        quantize_judge=quantize_judge,
+        model_label=model_name, seed=seed, results_file=_results_path(model_name), **judge_kwargs,
     )
     model.to('cpu')
     del model
@@ -984,16 +1333,31 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             if not os.path.exists(variant):
                 print(f"Skipping {variant} (not found)")
                 continue
-            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
+            variant_model = _load_iti_model(variant)
             label = f"{model_name}_top_{k}_alpha_{alpha}"
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
                 variant_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
-                model_label=label, seed=seed, results_file=_results_path(label),
-                quantize_judge=quantize_judge,
+                model_label=label, seed=seed, results_file=_results_path(label), **judge_kwargs,
             )
             # variant_model.to('cpu')
             print(f"k={k}, alpha={alpha} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+
+    if lora_adapter:
+        if not os.path.exists(lora_adapter):
+            print(f"LoRA adapter not found: {lora_adapter}")
+        else:
+            from peft import PeftModel
+            base_model = get_model_only(model_name, quantize=quantize)
+            lora_model = PeftModel.from_pretrained(base_model, lora_adapter)
+            lora_model = lora_model.merge_and_unload()
+            label = f"lora_{os.path.basename(lora_adapter.rstrip('/'))}"
+            (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = context_test(
+                lora_model, tokenizer, dataset_name, num_tests, quantize=quantize, dataset_path=dataset_path,
+                judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
+                model_label=label, seed=seed, results_file=_results_path(label), **judge_kwargs,
+            )
+            print(f"LoRA ({lora_adapter}) — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
 
 
 def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=1000):
@@ -1069,7 +1433,189 @@ def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=10
         print(f"{label} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
 
     del judge_model
+    gc.collect()
     ch.cuda.empty_cache()
+
+
+def run_rejudge_info(jsonl_files, hf_judge_info_model, bootstrap_iters=1000):
+    """Re-run only the informative axis using a HF logprob judge.
+
+    Reads each JSONL file, replaces ``decision_informative`` (and related fields)
+    using ``_hf_judge_logprob_decision`` with the "Helpful:" prompt suffix, and
+    leaves all context-axis fields untouched.  Saves results alongside the
+    original with a ``_hf_info`` suffix inserted before ``.jsonl``.
+    """
+    info_jmodel, info_jtok = get_truthfulqa_judge(hf_judge_info_model)
+
+    for jsonl_path in jsonl_files:
+        records = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+
+        if not records:
+            print(f"Skipping {jsonl_path}: no records.")
+            continue
+
+        print(f"\nRejudging informative axis: {len(records)} records from {jsonl_path} ...", flush=True)
+        for i, record in enumerate(records):
+            decision = _hf_judge_logprob_decision(
+                record["query"], record["response"], info_jmodel, info_jtok, "Helpful:"
+            )
+            record["judge_model_informative"]  = hf_judge_info_model
+            record["judge_prompt_informative"] = f"Q: {record['query']}\nA: {record['response']}\nHelpful:"
+            record["judge_raw_informative"]    = "yes" if decision else "no"
+            record["rationale_informative"]    = ""
+            record["decision_informative"]     = decision
+            if (i + 1) % 100 == 0:
+                print(f"  {i + 1}/{len(records)}", flush=True)
+
+        out_path = jsonl_path.replace(".jsonl", "_hf_info.jsonl")
+        with open(out_path, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        print(f"Saved: {out_path}", flush=True)
+
+        decisions_context = [r["decision_context_A"] for r in records]
+        decisions_info    = [r["decision_informative"] for r in records]
+        decisions_both    = [a and b for a, b in zip(decisions_context, decisions_info)]
+        (ti, tilo, tihi) = bootstrap_ci(decisions_both, B=bootstrap_iters)
+        (t,  tlo,  thi)  = bootstrap_ci(decisions_context, B=bootstrap_iters)
+        (i,  ilo,  ihi)  = bootstrap_ci(decisions_info, B=bootstrap_iters)
+        model_label = records[0].get("model", jsonl_path)
+        m = re.search(r'_top_(\d+)_alpha_([\d.]+)', model_label)
+        label = f"k={m.group(1)}, alpha={m.group(2)}" if m else "Base model"
+        print(f"{label} — context*info: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  info: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
+
+    del info_jmodel
+    gc.collect()
+    ch.cuda.empty_cache()
+
+
+def run_rejudge_context(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=1000):
+    """Re-run only the context axis using a regular LLM judge.
+
+    Reads each JSONL file, replaces all ``*_context_A`` fields using
+    ``_JUDGE_PROMPT_CONTEXT["A"]``, and leaves all informative-axis fields
+    (``judge_model_informative``, ``decision_informative``, etc.) untouched.
+    Saves results alongside the original with a ``_ctx_rejudged`` suffix.
+    """
+    judge_model, judge_tokenizer = get_model(judge_model_name, quantize=quantize)
+
+    for jsonl_path in jsonl_files:
+        records = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+
+        if not records:
+            print(f"Skipping {jsonl_path}: no records.")
+            continue
+
+        print(f"\nRejudging context axis: {len(records)} records from {jsonl_path} ...", flush=True)
+        for i, record in enumerate(records):
+            answer_str = (
+                f"Context: {record['context']}\nQuestion: {record['query']}\n"
+                f"Generated Response: {record['response']}\nContext-aligned Response: {record['corr_answer']}"
+            )
+            task = _JUDGE_PROMPT_CONTEXT["A"].format(answer=answer_str)
+            jp = judge_tokenizer.apply_chat_template(
+                [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+            )
+            input_ids = judge_tokenizer(jp, return_tensors="pt").to("cuda")
+            with ch.no_grad():
+                output_ids = judge_model.generate(
+                    **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=judge_tokenizer.eos_token_id
+                )
+            raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
+            rationale, decision = _parse_judge_response(raw)
+            record["judge_model_context"]      = judge_model_name
+            record["judge_prompt_context_A"]   = task
+            record["judge_raw_context_A"]      = raw
+            record["rationale_context_A"]      = rationale
+            record["decision_context_A"]       = decision
+            if (i + 1) % 100 == 0:
+                print(f"  {i + 1}/{len(records)}", flush=True)
+
+        out_path = jsonl_path.replace(".jsonl", "_ctx_rejudged.jsonl")
+        with open(out_path, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        print(f"Saved: {out_path}", flush=True)
+
+        decisions_context = [r["decision_context_A"] for r in records]
+        decisions_info    = [r["decision_informative"] for r in records]
+        decisions_both    = [a and b for a, b in zip(decisions_context, decisions_info)]
+        (ti, tilo, tihi) = bootstrap_ci(decisions_both, B=bootstrap_iters)
+        (t,  tlo,  thi)  = bootstrap_ci(decisions_context, B=bootstrap_iters)
+        (i,  ilo,  ihi)  = bootstrap_ci(decisions_info, B=bootstrap_iters)
+        model_label = records[0].get("model", jsonl_path)
+        m = re.search(r'_top_(\d+)_alpha_([\d.]+)', model_label)
+        label = f"k={m.group(1)}, alpha={m.group(2)}" if m else "Base model"
+        print(f"{label} — context*info: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  info: {i:.3f} [{ilo:.3f}, {ihi:.3f}]", flush=True)
+
+    del judge_model
+    gc.collect()
+    ch.cuda.empty_cache()
+
+
+def run_analyze(jsonl_files, bootstrap_iters=1000):
+    """Print bootstrapped accuracy split by even/odd sample_idx.
+
+    Even sample_idx (0, 2, 4, …) correspond to true-context samples;
+    odd sample_idx (1, 3, 5, …) correspond to false-context (counter-memory) samples.
+
+    For each JSONL file reports:
+    - Overall  context / informative / context*informative accuracy with 95% CI
+    - True-context  subset (even sample_idx)
+    - False-context subset (odd sample_idx)
+    """
+    def _report(label, recs, B):
+        if not recs:
+            print(f"  {label}: no records")
+            return
+        dc = [r["decision_context_A"] for r in recs]
+        di = [r["decision_informative"] for r in recs]
+        db = [a and b for a, b in zip(dc, di)]
+        ti, tilo, tihi = bootstrap_ci(db, B=B)
+        t,  tlo,  thi  = bootstrap_ci(dc, B=B)
+        i,  ilo,  ihi  = bootstrap_ci(di, B=B)
+        print(
+            f"  {label} (n={len(recs)}) — "
+            f"context*info: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  "
+            f"context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  "
+            f"info: {i:.3f} [{ilo:.3f}, {ihi:.3f}]"
+        )
+
+    for jsonl_path in jsonl_files:
+        records = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+
+        if not records:
+            print(f"Skipping {jsonl_path}: no records.")
+            continue
+
+        # Determine a short label from the model field or filename
+        model_label = records[0].get("model", jsonl_path)
+        m = re.search(r'_top_(\d+)_alpha_([\d.]+)', jsonl_path)
+        header = f"k={m.group(1)}, alpha={m.group(2)}" if m else model_label
+        print(f"\n{header}  [{jsonl_path}]")
+
+        even_recs = [r for r in records if r.get("sample_idx", 0) % 2 == 0]
+        odd_recs  = [r for r in records if r.get("sample_idx", 0) % 2 == 1]
+
+        _report("all   ", records,   bootstrap_iters)
+        _report("even (true ctx) ", even_recs, bootstrap_iters)
+        _report("odd  (false ctx)", odd_recs,  bootstrap_iters)
 
 
 def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/updated_models",
@@ -1114,7 +1660,11 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
                 print(f"Skipping {model_path} (not found)")
                 continue
             label = model_path
-            explicit_model, tokenizer = _load_explicit_model(model_path, model_name, quantize)
+            try:
+                explicit_model, tokenizer = _load_explicit_model(model_path, model_name, quantize)
+            except (OSError, ValueError) as e:
+                print(f"Skipping {model_path} (failed to load: {e})", flush=True)
+                continue
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
                 explicit_model, tokenizer, dataset_path, num_tests, quantize=quantize,
                 judge_model_name=judge_model_name, bootstrap_iters=bootstrap_iters,
@@ -1138,7 +1688,7 @@ def run_test_truth(model_name, ks, alphas, num_tests=100, models_dir="Truth/upda
             if not os.path.exists(variant):
                 print(f"Skipping {variant} (not found)")
                 continue
-            variant_model = AutoModelForCausalLM.from_pretrained(variant, device_map="cuda")
+            variant_model = _load_iti_model(variant)
             label = f"{model_name}_top_{k}_alpha_{alpha}"
             (ti, tilo, tihi), (t, tlo, thi), (i, ilo, ihi) = truth_test(
                 variant_model, tokenizer, dataset_path, num_tests, quantize=quantize,
@@ -1384,6 +1934,508 @@ def run_compare(model_name, dataset_name, ks, alphas, num_tests=50,
 
 
 # ---------------------------------------------------------------------------
+# Attribution experiment: ContextCite vs probe-based attribution
+# ---------------------------------------------------------------------------
+
+def _split_sentences(text):
+    """Split text into sentence-level attribution sources."""
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+    # If only one sentence, fall back to splitting on commas/semicolons
+    if len(parts) < 2:
+        parts = re.split(r'(?<=[,;])\s+', text.strip())
+        parts = [p.strip() for p in parts if p.strip()]
+    return parts if len(parts) >= 2 else [text.strip()]
+
+
+def build_prob_experiment_dataset(dataset_path, dataset_size, seed=42):
+    entries = []
+    with open(dataset_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    random.seed(seed)
+    random.shuffle(entries)
+    entries = entries[:dataset_size]
+
+    instances = []
+    for entry in entries:
+        q = entry["question"]
+        mem_ans = entry["memory_answer"]
+        ctr_ans = entry["counter_answer"]
+        mem_ctx = entry["parametric_memory_aligned_evidence"]
+        ctr_ctx = entry["counter_memory_aligned_evidence"]
+
+        for category, answer, match_ctx, nonmatch_ctx in [
+            ("true",  mem_ans, mem_ctx, ctr_ctx),
+            ("false", ctr_ans, ctr_ctx, mem_ctx),
+        ]:
+            instances.append({"category": category, "subcategory": "matching",     "context": match_ctx,    "question": q, "answer": answer})
+            instances.append({"category": category, "subcategory": "non_matching", "context": nonmatch_ctx, "question": q, "answer": answer})
+            instances.append({"category": category, "subcategory": "no_context",   "context": "",           "question": q, "answer": answer})
+    return instances
+
+
+def score_model_on_prob_dataset(model, tokenizer, instances):
+    results = []
+    for inst in instances:
+        answer_ids = tokenizer(inst["answer"], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        token_lps = _response_token_log_probs(model, tokenizer, inst["question"], inst["context"], answer_ids)
+        record = dict(inst)
+        record["mean_log_prob"] = float(token_lps.mean())
+        results.append(record)
+    return results
+
+
+def run_prob_experiment(model_name, ks, alphas, dataset_size=500, models_dir="updated_models",
+                        output_dir=None, quantize=True, dataset_path=None, seed=42,
+                        bootstrap_iters=1000):
+    dataset_path = dataset_path or "../PopQA/conflictQA-popQA-chatgpt.json"
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    instances = build_prob_experiment_dataset(dataset_path, dataset_size, seed=seed)
+    print(f"Built dataset: {len(instances)} instances ({dataset_size} entries × 6 categories)")
+
+    col_keys = [
+        ("true",  "matching"), ("true",  "non_matching"), ("true",  "no_context"),
+        ("false", "matching"), ("false", "non_matching"), ("false", "no_context"),
+    ]
+
+    def _evaluate(model, label):
+        t0 = time.time()
+        results = score_model_on_prob_dataset(model, tokenizer, instances)
+        elapsed = time.time() - t0
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe = label.replace('/', '_').replace(' ', '_')
+        filename = f"prob_experiment_{safe}_{ts}.jsonl"
+        out_path = os.path.join(output_dir, filename) if output_dir else filename
+        with open(out_path, 'w') as f:
+            for r in results:
+                f.write(json.dumps(r) + '\n')
+
+        groups = {}
+        for r in results:
+            groups.setdefault((r["category"], r["subcategory"]), []).append(r["mean_log_prob"])
+
+        parts = []
+        for cat, sub in col_keys:
+            mean, lo, hi = bootstrap_ci(groups[(cat, sub)], B=bootstrap_iters)
+            parts.append(f"{cat}/{sub}={mean:.3f} [{lo:.3f},{hi:.3f}]")
+        print(f"{label}  ({elapsed:.1f}s)")
+        print("  " + "  ".join(parts))
+        print(f"  → saved to {out_path}")
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+    _evaluate(model, model_name)
+    model.to('cpu')
+    del model
+    gc.collect()
+    ch.cuda.empty_cache()
+
+    for k in ks:
+        for alpha in alphas:
+            variant = f"{models_dir}/{model_name.replace('/', '_')}_top_{k}_alpha_{alpha}_context"
+            if not os.path.exists(variant):
+                print(f"Skipping {variant} (not found)")
+                continue
+            variant_model = _load_iti_model(variant)
+            _evaluate(variant_model, f"{model_name}_top_{k}_alpha_{alpha}")
+            variant_model.to('cpu')
+            del variant_model
+            gc.collect()
+            ch.cuda.empty_cache()
+
+
+def _rebuild_context(sources, mask):
+    """Reconstruct context string from sentence sources and a binary mask."""
+    return ' '.join(s for s, m in zip(sources, mask) if m)
+
+
+def _response_token_log_probs(model, tokenizer, query, context, response_ids):
+    """Return per-token log-probs (np.ndarray, shape [resp_len]) for response_ids."""
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": f"{context}\nPlease answer the question in one short sentence.\nQuestion: {query}"}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    full_ids = ch.cat([prompt_ids, response_ids.cpu()], dim=1).to('cuda')
+
+    with ch.no_grad():
+        logits = model(full_ids).logits  # [1, seq_len, vocab]
+
+    prompt_len = prompt_ids.shape[1]
+    resp_len = response_ids.shape[1]
+    # logit[i] predicts token[i+1]; response starts at prompt_len
+    resp_logits = logits[0, prompt_len - 1: prompt_len - 1 + resp_len, :]
+    log_probs = ch.log_softmax(resp_logits, dim=-1)
+    token_lps = log_probs[ch.arange(resp_len), response_ids[0].cpu()].float().cpu().numpy()
+    return token_lps
+
+
+def _probe_context_score(model, tokenizer, query, context, response_ids, probes, top_heads):
+    """Return mean probe P(context-following) over top heads at last response token."""
+    num_heads = model.config.num_attention_heads
+    head_dim  = model.config.hidden_size // num_heads
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": f"{context}\nPlease answer the question in one short sentence.\nQuestion: {query}"}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    full_ids = ch.cat([prompt_ids, response_ids.cpu()], dim=1).to('cuda')
+
+    head_acts = {}
+    hooks = []
+    for (layer_idx, head_idx) in top_heads:
+        def _make_hook(l, h):
+            def _hook(module, inp, out):
+                x = inp[0][0, -1, :].detach()   # last token, [hidden]
+                head_acts[(l, h)] = x.view(num_heads, head_dim)[h].float().cpu().numpy()
+            return _hook
+        hooks.append(
+            model.model.layers[layer_idx].self_attn.o_proj.register_forward_hook(_make_hook(layer_idx, head_idx))
+        )
+
+    with ch.no_grad():
+        model(full_ids)
+    for h in hooks:
+        h.remove()
+
+    scores = []
+    for (layer_idx, head_idx) in top_heads:
+        if (layer_idx, head_idx) not in head_acts:
+            continue
+        act   = head_acts[(layer_idx, head_idx)].reshape(1, -1)
+        probe = probes[layer_idx][head_idx]
+        scores.append(float(probe.predict_proba(act)[0, 1]))
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def _probe_answer_score(model, tokenizer, query, context, response_ids, probes, top_heads, accuracies):
+    """Return mean probe P(context-following) averaged over all answer tokens and top heads (accuracy-weighted)."""
+    num_heads = model.config.num_attention_heads
+    head_dim = model.config.hidden_size // num_heads
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": (
+            f"Here is some confirmed context information:\n{context}\n"
+            f"Please answer the question based solely on the context above in one short sentence.\n"
+            f"Question: {query}\n"
+        )}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    resp_len = response_ids.shape[1]
+    full_ids = ch.cat([prompt_ids, response_ids.cpu()], dim=1).to('cuda')
+    prompt_len = prompt_ids.shape[1]
+
+    head_acts = {}
+    hooks = []
+    for (layer_idx, head_idx) in top_heads:
+        def _make_hook(l, h):
+            def _hook(module, inp, out):
+                x = inp[0][0, prompt_len:prompt_len + resp_len, :].detach()  # [resp_len, hidden]
+                head_acts[(l, h)] = x.view(resp_len, num_heads, head_dim)[:, h, :].float().cpu().numpy()
+            return _hook
+        hooks.append(model.model.layers[layer_idx].self_attn.o_proj.register_forward_hook(_make_hook(layer_idx, head_idx)))
+
+    with ch.no_grad():
+        model(full_ids)
+    for h in hooks:
+        h.remove()
+
+    total_score = 0.0
+    total_weight = 0.0
+    for (layer_idx, head_idx) in top_heads:
+        if (layer_idx, head_idx) not in head_acts:
+            continue
+        acts = head_acts[(layer_idx, head_idx)]  # [resp_len, head_dim]
+        proba = probes[layer_idx][head_idx].predict_proba(acts)[:, 1]  # [resp_len]
+        w = float(accuracies[layer_idx][head_idx])
+        total_score += float(proba.mean()) * w
+        total_weight += w
+    return total_score / total_weight if total_weight > 0 else 0.0
+
+
+def score_model_on_probe_dataset(model, tokenizer, instances, probes, accuracies, top_k=16):
+    top_heads = get_top_k_heads(accuracies, top_k)
+    results = []
+    for inst in instances:
+        response_ids = tokenizer(inst["answer"], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        score = _probe_answer_score(model, tokenizer, inst["question"], inst["context"], response_ids, probes, top_heads, accuracies)
+        record = dict(inst)
+        record["mean_probe_score"] = score
+        results.append(record)
+    return results
+
+
+def run_probe_score_experiment(model_name, probes_path, accuracies_path,
+                                dataset_size=500, top_ks=(16,), output_dir=None,
+                                quantize=True, dataset_path=None, seed=42,
+                                bootstrap_iters=1000, top_bottom_n=100):
+    dataset_path = dataset_path or "../PopQA/conflictQA-popQA-chatgpt.json"
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    instances = build_prob_experiment_dataset(dataset_path, dataset_size, seed=seed)
+    print(f"Built dataset: {len(instances)} instances ({dataset_size} entries × 6 categories)")
+
+    with open(probes_path, "rb") as f:
+        probes = pickle.load(f)
+    accuracies = []
+    with open(accuracies_path, "r") as f:
+        for line in f:
+            accuracies.append(list(map(float, line.split())))
+    accuracies = np.array(accuracies)
+
+    col_keys = [
+        ("true",  "matching"), ("true",  "non_matching"), ("true",  "no_context"),
+        ("false", "matching"), ("false", "non_matching"), ("false", "no_context"),
+    ]
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+
+    for top_k in top_ks:
+        t0 = time.time()
+        results = score_model_on_probe_dataset(model, tokenizer, instances, probes, accuracies, top_k=top_k)
+        elapsed = time.time() - t0
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe = model_name.replace('/', '_').replace(' ', '_')
+        filename = f"probe_score_experiment_{safe}_top{top_k}_{ts}.jsonl"
+        out_path = os.path.join(output_dir, filename) if output_dir else filename
+        with open(out_path, 'w') as f:
+            for r in results:
+                f.write(json.dumps(r) + '\n')
+
+        groups = {}
+        for r in results:
+            groups.setdefault((r["category"], r["subcategory"]), []).append(r["mean_probe_score"])
+
+        parts = []
+        for cat, sub in col_keys:
+            mean, lo, hi = bootstrap_ci(groups[(cat, sub)], B=bootstrap_iters)
+            parts.append(f"{cat}/{sub}={mean:.3f} [{lo:.3f},{hi:.3f}]")
+        print(f"{model_name} top_k={top_k}  ({elapsed:.1f}s)")
+        print("  " + "  ".join(parts))
+
+        if top_bottom_n > 0:
+            top_parts, bot_parts = [], []
+            for cat, sub in col_keys:
+                scores = sorted(groups[(cat, sub)], reverse=True)
+                top_scores = scores[:top_bottom_n]
+                bot_scores = scores[-top_bottom_n:]
+                t_mean, t_lo, t_hi = bootstrap_ci(top_scores, B=bootstrap_iters)
+                b_mean, b_lo, b_hi = bootstrap_ci(bot_scores, B=bootstrap_iters)
+                top_parts.append(f"{cat}/{sub}={t_mean:.3f} [{t_lo:.3f},{t_hi:.3f}]")
+                bot_parts.append(f"{cat}/{sub}={b_mean:.3f} [{b_lo:.3f},{b_hi:.3f}]")
+            actual_n = min(top_bottom_n, min(len(v) for v in groups.values()))
+            print(f"  top-{actual_n}: " + "  ".join(top_parts))
+            print(f"  bot-{actual_n}: " + "  ".join(bot_parts))
+
+        print(f"  → saved to {out_path}")
+
+
+def _fit_linear(masks, scores):
+    """Ridge regression: masks [M, S] → scores [M]. Returns (coef, intercept)."""
+    from sklearn.linear_model import Ridge
+    reg = Ridge(alpha=1e-3, fit_intercept=True)
+    reg.fit(masks, scores)
+    return reg.coef_, reg.intercept_, reg
+
+
+def _pearson_r(x, y):
+    if np.std(x) < 1e-10 or np.std(y) < 1e-10:
+        return float('nan')
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def run_attribution_experiment(
+    model_name, dataset_name, probes_path, accuracies_path,
+    top_k_heads=16, num_tests=50, num_masks=128, seed=42,
+    methods=("context_cite", "probe"), k_fracs=(0.1, 0.25, 0.5),
+    quantize=True, dataset_path=None, output_file=None,
+):
+    """Attribution experiment comparing ContextCite and probe-based attribution.
+
+    For each sample (query, context, response) the experiment:
+
+    1. Splits the context into sentence-level *sources*.
+    2. Samples ``num_masks`` random binary masks (same seed → both methods see
+       identical masks for a fair comparison).
+    3. For every mask computes:
+       - ``log P(response | masked_context)`` — the ContextCite signal.
+       - ``probe_score(response | masked_context)`` — mean P(context-following)
+         across the top-k ITI probe heads.
+    4. Fits a Ridge linear model on each signal to derive per-source attributions.
+    5. Evaluates with:
+       - **LDS** (Linear Datamodeling Score): Pearson r between the linear
+         model's predictions and *actual log-probs* on held-out masks.
+         Both methods are scored against the same ground truth.
+       - **LPD** (Log-Prob Drop): drop in ``sum log P(response)`` when the
+         top-k% most attributed sources are removed.
+
+    Results are printed per sample and aggregated at the end.
+    Pass ``methods=("context_cite",)`` or ``methods=("probe",)`` to run only
+    one method; both still use the same masks and seed.
+    """
+    rng = np.random.default_rng(seed)
+
+    _ATTRIBUTION_DATASETS = {"hotpot_qa", "tydiqa", "cnn_dailymail"}
+    if dataset_name in _ATTRIBUTION_DATASETS:
+        dataset = get_attribution_dataset(dataset_name, num_tests, seed=seed)
+    else:
+        _, dataset = get_dataset(dataset_name, num_tests, second_dict=True, dataset_path=dataset_path)
+        dataset = list(dataset)
+
+    with open(probes_path, 'rb') as f:
+        probes = pickle.load(f)
+
+    accs = np.loadtxt(accuracies_path)
+    flat_idx = np.argsort(accs.ravel())[::-1][:top_k_heads]
+    top_heads = [(int(i // accs.shape[1]), int(i % accs.shape[1])) for i in flat_idx]
+    print(f"Top-{top_k_heads} heads: {top_heads[:5]}...")
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+    model.eval()
+
+    all_results = []
+
+    for sample_idx, row in enumerate(dataset):
+        query    = row['query']
+        context  = row['context']
+        response = row['corr_answer']
+
+        response_ids = tokenizer(response, add_special_tokens=False, return_tensors="pt")["input_ids"]
+        resp_len = response_ids.shape[1]
+        if resp_len == 0:
+            continue
+
+        sources   = _split_sentences(context)
+        n_sources = len(sources)
+        if n_sources < 2:
+            print(f"Sample {sample_idx}: only {n_sources} source(s), skipping.")
+            continue
+
+        # ---- Masks: same for both methods (fair comparison) ----
+        sample_rng = np.random.default_rng([seed, sample_idx])
+        masks = sample_rng.integers(0, 2, size=(num_masks, n_sources)).astype(float)
+        # Avoid empty-context masks
+        empty = masks.sum(axis=1) == 0
+        for i in np.where(empty)[0]:
+            masks[i, sample_rng.integers(0, n_sources)] = 1
+
+        n_train   = num_masks * 3 // 4
+        tr_masks  = masks[:n_train]
+        te_masks  = masks[n_train:]
+
+        print(f"\nSample {sample_idx + 1}/{len(dataset)} | sources={n_sources} | resp_tokens={resp_len}", flush=True)
+
+        # ---- Compute log-probs for all masks (needed by both methods) ----
+        lp_all = np.zeros((num_masks, resp_len))
+        print(f"  log-probs ({num_masks} masks)...", end=" ", flush=True)
+        for mi, mask in enumerate(masks):
+            ctx = _rebuild_context(sources, mask) or sources[0]
+            lp_all[mi] = _response_token_log_probs(model, tokenizer, query, ctx, response_ids)
+        print("done", flush=True)
+
+        tr_sum_lp = lp_all[:n_train].sum(axis=1)
+        te_sum_lp = lp_all[n_train:].sum(axis=1)
+
+        # Full-context baseline (for LPD)
+        full_lp     = _response_token_log_probs(model, tokenizer, query, context, response_ids)
+        full_sum_lp = float(full_lp.sum())
+
+        # ---- Probe scores (only if needed) ----
+        probe_all = None
+        if "probe" in methods:
+            probe_all = np.zeros(num_masks)
+            print(f"  probe scores ({num_masks} masks)...", end=" ", flush=True)
+            for mi, mask in enumerate(masks):
+                ctx = _rebuild_context(sources, mask) or sources[0]
+                probe_all[mi] = _probe_context_score(
+                    model, tokenizer, query, ctx, response_ids, probes, top_heads
+                )
+            print("done", flush=True)
+
+        def _lpd(coef, k_frac):
+            k = max(1, int(round(n_sources * k_frac)))
+            top_idx = np.argsort(coef)[::-1][:k]
+            abl_mask = np.ones(n_sources)
+            abl_mask[top_idx] = 0
+            abl_ctx = _rebuild_context(sources, abl_mask) or sources[np.argmin(coef)]
+            abl_lp  = _response_token_log_probs(model, tokenizer, query, abl_ctx, response_ids)
+            return float(full_sum_lp - abl_lp.sum())
+
+        record = {
+            "sample_idx": sample_idx,
+            "query": query,
+            "n_sources": n_sources,
+            "resp_len": resp_len,
+        }
+
+        if "context_cite" in methods:
+            cc_coef, cc_int, _ = _fit_linear(tr_masks, tr_sum_lp)
+            cc_pred_te = te_masks @ cc_coef + cc_int
+            cc_lds = _pearson_r(cc_pred_te, te_sum_lp)
+            cc_lpd = {f"k{int(kf*100)}": _lpd(cc_coef, kf) for kf in k_fracs}
+            record["context_cite"] = {
+                "lds": cc_lds, "lpd": cc_lpd, "attributions": cc_coef.tolist(),
+            }
+            print(f"  ContextCite: LDS={cc_lds:.3f}  " +
+                  "  ".join(f"LPD@{int(kf*100)}%={cc_lpd[f'k{int(kf*100)}']:.3f}" for kf in k_fracs),
+                  flush=True)
+
+        if "probe" in methods:
+            pr_coef, pr_int, _ = _fit_linear(tr_masks, probe_all[:n_train])
+            # LDS: probe linear model vs actual log-probs on test set
+            pr_pred_te = te_masks @ pr_coef + pr_int
+            pr_lds = _pearson_r(pr_pred_te, te_sum_lp)
+            pr_lpd = {f"k{int(kf*100)}": _lpd(pr_coef, kf) for kf in k_fracs}
+            record["probe"] = {
+                "lds": pr_lds, "lpd": pr_lpd, "attributions": pr_coef.tolist(),
+            }
+            print(f"  Probe:       LDS={pr_lds:.3f}  " +
+                  "  ".join(f"LPD@{int(kf*100)}%={pr_lpd[f'k{int(kf*100)}']:.3f}" for kf in k_fracs),
+                  flush=True)
+
+        all_results.append(record)
+
+    # ---- Aggregate ----
+    print("\n" + "="*60)
+    print("Aggregate results")
+    print("="*60)
+    for method in ("context_cite", "probe"):
+        if method not in methods:
+            continue
+        mrs = [r[method] for r in all_results if method in r]
+        if not mrs:
+            continue
+        avg_lds = float(np.nanmean([r["lds"] for r in mrs]))
+        print(f"\n{method}  (n={len(mrs)})")
+        print(f"  LDS (mean Pearson r):  {avg_lds:.3f}")
+        for kf in k_fracs:
+            key = f"k{int(kf*100)}"
+            vals = [r["lpd"][key] for r in mrs if key in r["lpd"]]
+            print(f"  LPD @ {int(kf*100):2d}%:           {float(np.nanmean(vals)):.3f}  "
+                  f"(std {float(np.nanstd(vals)):.3f})")
+
+    if output_file:
+        with open(output_file, 'w') as f:
+            for r in all_results:
+                f.write(json.dumps(r) + '\n')
+        print(f"\nPer-sample results saved to {output_file}")
+
+    del model
+    gc.collect()
+    ch.cuda.empty_cache()
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1396,7 +2448,7 @@ def build_parser():
 
     # Shared arguments
     model_kwargs = dict(default="meta-llama/Meta-Llama-3-8B-Instruct", help="HuggingFace model ID")
-    dataset_kwargs = dict(choices=["ms_marco", "pop_qa", "truthQA"], default="pop_qa")
+    dataset_kwargs = dict(choices=["ms_marco", "pop_qa", "truthQA", "time_qa", "squad_v2"], default="pop_qa")
     ks_kwargs = dict(type=int, nargs="+", default=[16, 32, 48, 64, 80, 96], metavar="K", help="Top-k heads to intervene on")
     alphas_kwargs = dict(type=float, nargs="+", default=[2, 5, 7, 10], metavar="ALPHA", help="Intervention strength multipliers")
     quantize_kwargs = dict(action="store_true", dest="no_quantize", help="Load model in full precision (no 4-bit quantization)")
@@ -1449,9 +2501,14 @@ def build_parser():
     p.add_argument("--output-dir", default=None, help="Directory to save results JSONL files (default: current directory)")
     p.add_argument("--models", nargs="+", default=None, metavar="MODEL_PATH",
                    help="Explicit model paths to evaluate. When set, skips the base model and k/alpha sweep.")
+    p.add_argument("--lora-adapter", default=None, metavar="PATH",
+                   help="Path to a LoRA adapter directory. The adapter is merged into the base model and evaluated after the k/alpha sweep.")
     p.add_argument("--no-quantize", **quantize_kwargs)
     p.add_argument("--no-quantize-judge", action="store_true", dest="no_quantize_judge",
                    help="Load the judge model in full precision regardless of --no-quantize")
+    p.add_argument("--hf-judge-info-model", default=None, metavar="PATH",
+                   help="Path to a local HF model for informativeness judging (logprob-based, same as in test-truth). "
+                        "The context axis always uses --judge-model.")
 
     # --- rejudge ---
     p = subparsers.add_parser("rejudge", help="Re-evaluate saved responses from JSONL files with a different judge.")
@@ -1459,6 +2516,43 @@ def build_parser():
     p.add_argument("--judge-model", default="meta-llama/Meta-Llama-3-8B-Instruct", help="HuggingFace model ID for the new judge")
     p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
     p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- rejudge-context ---
+    p = subparsers.add_parser(
+        "rejudge-context",
+        help="Re-run only the context axis on saved JSONL files using a regular LLM judge.",
+    )
+    p.add_argument("jsonl_files", nargs="+", metavar="JSONL",
+                   help="One or more results_context_*.jsonl files to re-judge")
+    p.add_argument("--judge-model", default="meta-llama/Meta-Llama-3-8B-Instruct",
+                   help="HuggingFace model ID for the context judge")
+    p.add_argument("--bootstrap-iters", type=int, default=1000,
+                   help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- rejudge-info ---
+    p = subparsers.add_parser(
+        "rejudge-info",
+        help="Re-run only the informative axis on saved JSONL files using a HF logprob judge.",
+    )
+    p.add_argument("jsonl_files", nargs="+", metavar="JSONL",
+                   help="One or more results_context_*.jsonl files to re-judge")
+    p.add_argument("--hf-judge-info-model", required=True, metavar="PATH",
+                   help="Path to a local HF model for informativeness judging (logprob-based)")
+    p.add_argument("--bootstrap-iters", type=int, default=1000,
+                   help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--no-quantize-judge", action="store_true", dest="no_quantize_judge",
+                   help="Load the judge model in full precision (no 4-bit quantization)")
+
+    # --- analyze ---
+    p = subparsers.add_parser(
+        "analyze",
+        help="Print bootstrapped accuracy split by even/odd sample_idx (true vs false context) from saved JSONL files.",
+    )
+    p.add_argument("jsonl_files", nargs="+", metavar="JSONL",
+                   help="One or more results_context_*.jsonl files to analyze")
+    p.add_argument("--bootstrap-iters", type=int, default=1000,
+                   help="Bootstrap iterations for 95%% confidence intervals")
 
     # --- test-truth ---
     p = subparsers.add_parser("test-truth", help="Evaluate truthfulness on base + intervened models.")
@@ -1562,6 +2656,72 @@ def build_parser():
     p.add_argument("--lora-adapter", default=None, help="Path to LoRA adapter for full-LoRA evaluation (optional)")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
+    # --- attribute ---
+    p = subparsers.add_parser(
+        "attribute",
+        help="Attribution experiment: compare ContextCite vs probe-based source attribution.",
+    )
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset",
+                   choices=["hotpot_qa", "tydiqa", "cnn_dailymail", "pop_qa"],
+                   default="hotpot_qa",
+                   help="Dataset to use for attribution. hotpot_qa/tydiqa/cnn_dailymail are loaded "
+                        "from HuggingFace; pop_qa requires a local file.")
+    p.add_argument("--dataset-path", default=None,
+                   help="Override default dataset file path (only for pop_qa)")
+    p.add_argument("--probes", default="probes.pkl",
+                   help="Path to saved probes pickle (used by the probe method)")
+    p.add_argument("--accuracies", default=None,
+                   help="Path to accuracies .txt file (default: auto-detect from model name)")
+    p.add_argument("--top-k-heads", type=int, default=16, dest="top_k_heads",
+                   help="Number of top probe heads used for the probe attribution method")
+    p.add_argument("--num-tests", type=int, default=50,
+                   help="Number of (query, context, response) samples to evaluate")
+    p.add_argument("--num-masks", type=int, default=128,
+                   help="Number of random binary context masks per sample")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--methods", nargs="+", choices=["context_cite", "probe"],
+                   default=["context_cite", "probe"],
+                   help="Attribution methods to run (can specify one or both)")
+    p.add_argument("--k-fracs", type=float, nargs="+", default=[0.1, 0.25, 0.5],
+                   dest="k_fracs", metavar="K_FRAC",
+                   help="Fractions of sources to remove for the LPD metric")
+    p.add_argument("--output-file", default=None,
+                   help="Path to write per-sample JSONL results")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- prob-experiment ---
+    p = subparsers.add_parser("prob-experiment", help="Measure answer log-probabilities across 6 context/answer categories.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset-path", default="../PopQA/conflictQA-popQA-chatgpt.json",
+                   help="Path to ConflictQA JSONL dataset")
+    p.add_argument("--dataset-size", type=int, default=500,
+                   help="Number of ConflictQA entries to sample")
+    p.add_argument("--ks", **ks_kwargs)
+    p.add_argument("--alphas", **alphas_kwargs)
+    p.add_argument("--models-dir", default="updated_models")
+    p.add_argument("--output-dir", default=None, help="Directory to save per-model result JSONL files")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
+    # --- probe-score-experiment ---
+    p = subparsers.add_parser("probe-score-experiment", help="Measure mean probe attribution score across 6 context/answer categories (base model only).")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--probes", default="probes.pkl", help="Path to probes .pkl file")
+    p.add_argument("--accuracies", default=None, help="Path to accuracies .txt file (default: auto-detect from model name)")
+    p.add_argument("--dataset-path", default="../PopQA/conflictQA-popQA-chatgpt.json",
+                   help="Path to ConflictQA JSONL dataset")
+    p.add_argument("--dataset-size", type=int, default=500,
+                   help="Number of ConflictQA entries to sample")
+    p.add_argument("--top-k", type=int, nargs="+", default=[16], dest="top_k", metavar="K", help="Number of top probe heads to use for attribution (one run per value)")
+    p.add_argument("--output-dir", default=None, help="Directory to save result JSONL file")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--top-bottom-n", type=int, default=100, dest="top_bottom_n",
+                   help="Report stats for top-N and bottom-N results per group (0 to disable)")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
     return parser
 
 
@@ -1588,10 +2748,23 @@ def main():
                          judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
                          prompt_variant_check=args.prompt_variant_check, variant_subset=args.variant_subset,
                          seed=args.seed, output_dir=args.output_dir, explicit_models=args.models,
-                         quantize_judge=quantize_judge)
+                         quantize_judge=quantize_judge,
+                         hf_judge_info_model=args.hf_judge_info_model,
+                         lora_adapter=args.lora_adapter)
 
     elif args.mode == "rejudge":
         run_rejudge(args.jsonl_files, args.judge_model, quantize=quantize, bootstrap_iters=args.bootstrap_iters)
+
+    elif args.mode == "rejudge-context":
+        run_rejudge_context(args.jsonl_files, args.judge_model, quantize=quantize,
+                            bootstrap_iters=args.bootstrap_iters)
+
+    elif args.mode == "rejudge-info":
+        run_rejudge_info(args.jsonl_files, args.hf_judge_info_model,
+                         bootstrap_iters=args.bootstrap_iters)
+
+    elif args.mode == "analyze":
+        run_analyze(args.jsonl_files, bootstrap_iters=args.bootstrap_iters)
 
     elif args.mode == "test-truth":
         quantize_judge = False if getattr(args, "no_quantize_judge", False) else None
@@ -1642,6 +2815,54 @@ def main():
         run_compare(args.model, args.dataset, args.ks, args.alphas, args.num_tests,
                     args.probe_models_dir, args.lora_delta_models_dir,
                     args.lora_adapter, quantize=quantize, dataset_path=args.dataset_path)
+
+    elif args.mode == "attribute":
+        acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
+        run_attribution_experiment(
+            model_name=args.model,
+            dataset_name=args.dataset,
+            probes_path=args.probes,
+            accuracies_path=acc_path,
+            top_k_heads=args.top_k_heads,
+            num_tests=args.num_tests,
+            num_masks=args.num_masks,
+            seed=args.seed,
+            methods=tuple(args.methods),
+            k_fracs=tuple(args.k_fracs),
+            quantize=quantize,
+            dataset_path=args.dataset_path,
+            output_file=args.output_file,
+        )
+
+    elif args.mode == "prob-experiment":
+        run_prob_experiment(
+            model_name=args.model,
+            ks=args.ks,
+            alphas=args.alphas,
+            dataset_size=args.dataset_size,
+            models_dir=args.models_dir,
+            output_dir=args.output_dir,
+            quantize=quantize,
+            dataset_path=args.dataset_path,
+            seed=args.seed,
+            bootstrap_iters=args.bootstrap_iters,
+        )
+
+    elif args.mode == "probe-score-experiment":
+        acc_path = args.accuracies or f"accuracies_{args.model.replace('/', '_')}.txt"
+        run_probe_score_experiment(
+            model_name=args.model,
+            probes_path=args.probes,
+            accuracies_path=acc_path,
+            dataset_size=args.dataset_size,
+            top_ks=args.top_k,
+            output_dir=args.output_dir,
+            quantize=quantize,
+            dataset_path=args.dataset_path,
+            seed=args.seed,
+            bootstrap_iters=args.bootstrap_iters,
+            top_bottom_n=args.top_bottom_n,
+        )
 
 
 if __name__ == "__main__":
