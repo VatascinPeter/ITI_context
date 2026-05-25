@@ -208,20 +208,20 @@ def _plot_metric(data, metric_key, title, cmap, output_path=None, vmin=None, vma
     tc = _text_color(norm(base_s), cmap)
     ax_base.text(0.5, 0.5,
                  f'{base_s:.3f}\n[{base_lo:.3f}, {base_hi:.3f}]',
-                 ha='center', va='center', fontsize=12,
+                 ha='center', va='center', fontsize=18,
                  color=tc, fontweight='bold', linespacing=1.4,
                  transform=ax_base.transAxes)
     ax_base.set_yticks([0])
-    ax_base.set_yticklabels(['base'], fontsize=13)
+    ax_base.set_yticklabels(['base'], fontsize=18)
     ax_base.set_xticks([])
     ax_base.tick_params(bottom=False)
 
     # --- k × alpha matrix ---
     ax_main.imshow(score_mat, cmap=cmap, norm=norm, aspect='auto')
     ax_main.set_xticks(range(ncols))
-    ax_main.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=13)
+    ax_main.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=18)
     ax_main.set_yticks(range(nk))
-    ax_main.set_yticklabels(k_labels, fontsize=13)
+    ax_main.set_yticklabels(k_labels, fontsize=18)
 
     for r in range(nk):
         for c in range(ncols):
@@ -230,7 +230,7 @@ def _plot_metric(data, metric_key, title, cmap, output_path=None, vmin=None, vma
                 tc = _text_color(norm(s), cmap)
                 ax_main.text(c, r,
                              f'{s:.3f}\n[{lo_mat[r, c]:.3f}, {hi_mat[r, c]:.3f}]',
-                             ha='center', va='center', fontsize=12,
+                             ha='center', va='center', fontsize=18,
                              color=tc, fontweight='bold', linespacing=1.4)
 
     # Shared colorbar as legend
@@ -238,14 +238,15 @@ def _plot_metric(data, metric_key, title, cmap, output_path=None, vmin=None, vma
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=[ax_base, ax_main], orientation='vertical',
                         fraction=0.046, pad=0.04)
-    cbar.set_label('Score [0 – 1]', fontsize=12)
+    cbar.set_label('Score [0 – 1]', fontsize=18)
     cbar.set_ticks(np.linspace(0, 1, 11))
+    cbar.ax.tick_params(labelsize=18)
 
     ax_base.set_title(
         f'{title}\n'
         f'Judge: {data["model"]}   |   Dataset: {data["dataset"]}\n'
         f'Values in brackets are [2.5th, 97.5th] percentiles',
-        fontsize=13, pad=10,
+        fontsize=18, pad=10,
     )
 
     fig.tight_layout()
@@ -306,20 +307,20 @@ def _plot_percent(data, metric_key, title, cmap, output_path=None, vmin=None, vm
     tc = _text_color(norm(base_s), cmap)
     ax_base.text(0.5, 0.5,
                  f'{base_s:.1f}\n[{base_lo:.1f}, {base_hi:.1f}]',
-                 ha='center', va='center', fontsize=12,
+                 ha='center', va='center', fontsize=18,
                  color=tc, fontweight='bold', linespacing=1.4,
                  transform=ax_base.transAxes)
     ax_base.set_yticks([0])
-    ax_base.set_yticklabels(['base'], fontsize=13)
+    ax_base.set_yticklabels(['base'], fontsize=18)
     ax_base.set_xticks([])
     ax_base.tick_params(bottom=False)
 
     # --- k × alpha matrix ---
     ax_main.imshow(score_mat * 100, cmap=cmap, norm=norm, aspect='auto')
     ax_main.set_xticks(range(ncols))
-    ax_main.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=13)
+    ax_main.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=18)
     ax_main.set_yticks(range(nk))
-    ax_main.set_yticklabels(k_labels, fontsize=13)
+    ax_main.set_yticklabels(k_labels, fontsize=18)
 
     for r in range(nk):
         for c in range(ncols):
@@ -328,7 +329,7 @@ def _plot_percent(data, metric_key, title, cmap, output_path=None, vmin=None, vm
                 tc = _text_color(norm(s * 100), cmap)
                 ax_main.text(c, r,
                              f'{s*100:.1f}\n[{lo_mat[r, c]*100:.1f}, {hi_mat[r, c]*100:.1f}]',
-                             ha='center', va='center', fontsize=12,
+                             ha='center', va='center', fontsize=18,
                              color=tc, fontweight='bold', linespacing=1.4)
 
     # Shared colorbar as legend
@@ -336,14 +337,15 @@ def _plot_percent(data, metric_key, title, cmap, output_path=None, vmin=None, vm
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=[ax_base, ax_main], orientation='vertical',
                         fraction=0.046, pad=0.04)
-    cbar.set_label('Score (%)', fontsize=12)
+    cbar.set_label('Score (%)', fontsize=18)
     cbar.set_ticks(np.linspace(vmin * 100, vmax * 100, 6))
+    cbar.ax.tick_params(labelsize=18)
 
     ax_base.set_title(
         f'{title} (%)\n'
         f'Judge: {data["model"]}   |   Dataset: {data["dataset"]}\n'
         f'Values in brackets are [2.5th, 97.5th] percentiles',
-        fontsize=13, pad=10,
+        fontsize=18, pad=10,
     )
 
     fig.tight_layout()
@@ -543,8 +545,9 @@ def plot_probe_scatter(truth_path, context_path, cmap='viridis', threshold=None,
                     vmin=0, vmax=num_layers - 1)
 
     cbar = fig.colorbar(sc, ax=ax)
-    cbar.set_label('Layer', fontsize=10)
+    cbar.set_label('Layer', fontsize=18)
     cbar.set_ticks(np.linspace(0, num_layers - 1, min(num_layers, 9)).astype(int))
+    cbar.ax.tick_params(labelsize=18)
 
     # Threshold lines
     ax.axvline(t_thr, color='#555555', linestyle='--', linewidth=0.9, alpha=0.8)
@@ -558,17 +561,18 @@ def plot_probe_scatter(truth_path, context_path, cmap='viridis', threshold=None,
     # Quadrant labels — placed at the midpoint of each quadrant
     xlim = ax.get_xlim()
     ylim = ax.get_ylim()
-    label_kw = dict(fontsize=7.5, color='#444444', alpha=0.85, ha='center', va='center')
+    label_kw = dict(fontsize=18, color='#444444', alpha=0.85, ha='center', va='center')
     ax.text((xlim[0] + t_thr) / 2, (ylim[1] + c_thr) / 2, 'context\nspecialist', **label_kw)
     ax.text((xlim[1] + t_thr) / 2, (ylim[1] + c_thr) / 2, 'generalist',          **label_kw)
     ax.text((xlim[0] + t_thr) / 2, (ylim[0] + c_thr) / 2, 'neither',             **label_kw)
     ax.text((xlim[1] + t_thr) / 2, (ylim[0] + c_thr) / 2, 'truth\nspecialist',   **label_kw)
 
-    ax.set_xlabel(f'Truth probe accuracy ({unit})', fontsize=11)
-    ax.set_ylabel(f'Context probe accuracy ({unit})', fontsize=11)
+    ax.set_xlabel(f'Truth probe accuracy ({unit})', fontsize=18)
+    ax.set_ylabel(f'Context probe accuracy ({unit})', fontsize=18)
+    ax.tick_params(labelsize=18)
     ax.set_title(
         'Attention head probe accuracies: Truthfulness vs. Context Grounding',
-        fontsize=11,
+        fontsize=18,
     )
 
     fig.tight_layout()
@@ -715,20 +719,20 @@ def _plot_prob_heatmap(data, category_key, title, cmap, output_path, vmin, vmax)
     tc = _text_color(norm(base_s), cmap)
     ax_base.text(0.5, 0.5,
                  f'{base_s:.3f}\n[{base_lo:.3f}, {base_hi:.3f}]',
-                 ha='center', va='center', fontsize=12,
+                 ha='center', va='center', fontsize=18,
                  color=tc, fontweight='bold', linespacing=1.4,
                  transform=ax_base.transAxes)
     ax_base.set_yticks([0])
-    ax_base.set_yticklabels(['base'], fontsize=13)
+    ax_base.set_yticklabels(['base'], fontsize=18)
     ax_base.set_xticks([])
     ax_base.tick_params(bottom=False)
 
     # k × alpha matrix
     ax_main.imshow(score_mat, cmap=cmap, norm=norm, aspect='auto')
     ax_main.set_xticks(range(ncols))
-    ax_main.set_xticklabels([f'α={a:g}' for a in alphas], rotation=45, ha='right', fontsize=13)
+    ax_main.set_xticklabels([f'α={a:g}' for a in alphas], rotation=45, ha='right', fontsize=18)
     ax_main.set_yticks(range(nk))
-    ax_main.set_yticklabels([f'k={k}' for k in ks], fontsize=13)
+    ax_main.set_yticklabels([f'k={k}' for k in ks], fontsize=18)
 
     for r in range(nk):
         for c in range(ncols):
@@ -737,19 +741,20 @@ def _plot_prob_heatmap(data, category_key, title, cmap, output_path, vmin, vmax)
                 tc = _text_color(norm(s), cmap)
                 ax_main.text(c, r,
                              f'{s:.3f}\n[{lo_mat[r, c]:.3f}, {hi_mat[r, c]:.3f}]',
-                             ha='center', va='center', fontsize=12,
+                             ha='center', va='center', fontsize=18,
                              color=tc, fontweight='bold', linespacing=1.4)
 
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=[ax_base, ax_main], orientation='vertical',
                         fraction=0.046, pad=0.04)
-    cbar.set_label('Mean log-prob (higher = more likely)', fontsize=12)
+    cbar.set_label('Mean log-prob (higher = more likely)', fontsize=18)
+    cbar.ax.tick_params(labelsize=18)
 
     ax_base.set_title(
         f'{title}\nModel: {data["model"]}\n'
         f'Values in brackets are [2.5th, 97.5th] percentiles',
-        fontsize=13, pad=10,
+        fontsize=18, pad=10,
     )
 
     fig.tight_layout()
@@ -800,6 +805,11 @@ def plot_prob_heatmaps(data, cmap='viridis', output_dir=None, vmin=None, vmax=No
 _PROBE_SCORE_LABEL_RE = re.compile(
     r'^(.+?)\s+top_k=(\d+)\s+\([\d.]+s\)\s*$'
 )
+_PROBE_SCORE_TOPBOT_RE = re.compile(r'^(top|bot)-(\d+):')
+# Accepts both '/' and '\' separators (average lines use '/', top/bot lines use '\')
+_PROB_ENTRY_RE_FLEX = re.compile(
+    r'(true|false)[/\\](matching|non_matching|no_context)=(-?[\d.]+)\s*\[(-?[\d.]+),(-?[\d.]+)\]'
+)
 
 
 def parse_probe_score_file(filepath):
@@ -807,19 +817,25 @@ def parse_probe_score_file(filepath):
 
     Looks for lines of the form:
         <model_name> top_k=<k>  (<time>s)
-          true/matching=X [lo,hi]  true/non_matching=X ...  (6 categories)
+          true/matching=X [lo,hi]  true/non_matching=X ...  (6 categories, average)
+          top-N: true\\matching=X ...                        (optional top-N stats)
+          bot-N: true\\matching=X ...                        (optional bottom-N stats)
 
     Returns
     -------
     dict with keys:
         'model'    : str
-        'variants' : dict — {k: {category_key: (mean, lo, hi)}}
+        'top_n'    : int or None — N used for top/bottom subsets
+        'variants' : dict — {k: {'avg': {cat_key: (mean, lo, hi)},
+                                  'top': {cat_key: ...},   # present if top-N line found
+                                  'bot': {cat_key: ...}}}  # present if bot-N line found
         'ks'       : sorted list[int]
     """
     filepath = Path(filepath)
     model_name = None
     variants = {}
     pending_k = None
+    top_n = None
 
     with open(filepath) as f:
         for line in f:
@@ -834,20 +850,35 @@ def parse_probe_score_file(filepath):
                 pending_k = int(m.group(2))
                 continue
 
-            if 'true/matching=' in stripped and pending_k is not None:
-                matches = _PROB_ENTRY_RE.findall(stripped)
+            tb = _PROBE_SCORE_TOPBOT_RE.match(stripped)
+            if tb and pending_k is not None and pending_k in variants:
+                which = tb.group(1)
+                if top_n is None:
+                    top_n = int(tb.group(2))
+                matches = _PROB_ENTRY_RE_FLEX.findall(stripped)
                 if len(matches) == 6:
-                    variants[pending_k] = {
+                    variants[pending_k][which] = {
                         f'{cat}/{sub}': (float(mean), float(lo), float(hi))
                         for cat, sub, mean, lo, hi in matches
                     }
-                    pending_k = None
+                continue
+
+            matches = _PROB_ENTRY_RE_FLEX.findall(stripped)
+            if len(matches) == 6 and pending_k is not None:
+                variants[pending_k] = {
+                    'avg': {
+                        f'{cat}/{sub}': (float(mean), float(lo), float(hi))
+                        for cat, sub, mean, lo, hi in matches
+                    }
+                }
+                # keep pending_k active so following top/bot lines can attach
 
     if not variants:
         raise ValueError(f"No probe score results found in {filepath}")
 
     return {
         'model':    model_name or filepath.stem,
+        'top_n':    top_n,
         'variants': variants,
         'ks':       sorted(variants.keys()),
     }
@@ -872,8 +903,8 @@ _PROBE_SCORE_BAR_LABELS = [
 ]
 
 
-def _plot_probe_score_bars(data, k, output_path, ymin, ymax):
-    entry = data['variants'][k]
+def _plot_probe_score_bars(data, k, which, output_path, ymin, ymax):
+    entry = data['variants'][k][which]
     keys  = [f'{cat}/{sub}' for cat, sub in _PROB_CATEGORIES]
 
     scores = np.array([entry[key][0] for key in keys])
@@ -885,29 +916,86 @@ def _plot_probe_score_bars(data, k, output_path, ymin, ymax):
     fig, ax = plt.subplots(figsize=(8, 4.5))
 
     xs = np.arange(len(keys))
-    bars = ax.bar(xs, scores, color=_PROBE_SCORE_BAR_COLORS,
-                  edgecolor='#444444', linewidth=0.7, width=0.6)
+    ax.bar(xs, scores, color=_PROBE_SCORE_BAR_COLORS,
+           edgecolor='#444444', linewidth=0.7, width=0.6)
     ax.errorbar(xs, scores, yerr=[err_lo, err_hi],
                 fmt='none', ecolor='#222222', elinewidth=1.2, capsize=4, capthick=1.2)
 
     for x, s in zip(xs, scores):
         ax.text(x, s + max(err_hi) * 0.15, f'{s:.3f}',
-                ha='center', va='bottom', fontsize=10, fontweight='bold')
+                ha='center', va='bottom', fontsize=18, fontweight='bold')
 
     ax.set_xticks(xs)
-    ax.set_xticklabels(_PROBE_SCORE_BAR_LABELS, fontsize=11)
-    ax.set_ylabel('Mean token grounding score', fontsize=11)
+    ax.set_xticklabels(_PROBE_SCORE_BAR_LABELS, fontsize=18)
+    ax.set_ylabel('Mean token grounding score', fontsize=18)
+    ax.tick_params(axis='y', labelsize=18)
     ax.set_ylim(ymin, ymax)
     ax.axhline(0.5, color='#888888', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax.axvline(2.5, color='#aaaaaa', linestyle=':', linewidth=1.0)
+
+    n_str = str(data.get('top_n') or 'N')
+    suffix = {'avg': '', 'top': f' — top-{n_str} samples', 'bot': f' — bottom-{n_str} samples'}[which]
     ax.set_title(
-        f'Probe-score results — top k={k}\n'
+        f'Probe-score results — top k={k}{suffix}\n'
         f'Model: {data["model"]}\n'
         f'Error bars are [2.5th, 97.5th] percentiles',
-        fontsize=12, pad=8,
+        fontsize=18, pad=8,
     )
 
-    # Vertical separator between true and false groups
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=200, bbox_inches='tight')
+        print(f'Saved: {output_path}')
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_probe_score_bars_combined(data, k, output_path, ymin, ymax):
+    """Bar chart showing average, top-N, and bottom-N side by side for each category."""
+    variant = data['variants'][k]
+    n_str   = str(data.get('top_n') or 'N')
+    present = [w for w in ('avg', 'top', 'bot') if w in variant]
+
+    if len(present) == 1:
+        _plot_probe_score_bars(data, k, present[0], output_path, ymin, ymax)
+        return
+
+    keys     = [f'{cat}/{sub}' for cat, sub in _PROB_CATEGORIES]
+    n_series = len(present)
+    bar_w    = 0.7 / n_series
+    xs       = np.arange(len(keys))
+    hatches  = {'avg': '', 'top': '///', 'bot': '\\\\\\'}
+    labels   = {'avg': 'Average', 'top': f'Top-{n_str}', 'bot': f'Bottom-{n_str}'}
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for si, which in enumerate(present):
+        entry  = variant[which]
+        offset = (si - (n_series - 1) / 2) * bar_w
+        scores = np.array([entry[key][0] for key in keys])
+        los    = np.array([entry[key][1] for key in keys])
+        his    = np.array([entry[key][2] for key in keys])
+        ax.bar(xs + offset, scores, width=bar_w,
+               color=_PROBE_SCORE_BAR_COLORS, edgecolor='#444444',
+               linewidth=0.7, hatch=hatches[which], label=labels[which])
+        ax.errorbar(xs + offset, scores, yerr=[scores - los, his - scores],
+                    fmt='none', ecolor='#222222', elinewidth=1.0, capsize=3)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(_PROBE_SCORE_BAR_LABELS, fontsize=18)
+    ax.set_ylabel('Mean token grounding score', fontsize=18)
+    ax.tick_params(axis='y', labelsize=18)
+    ax.set_ylim(ymin, ymax)
+    ax.axhline(0.5, color='#888888', linestyle='--', linewidth=0.8, alpha=0.7)
     ax.axvline(2.5, color='#aaaaaa', linestyle=':', linewidth=1.0)
+    ax.legend(fontsize=18)
+    ax.set_title(
+        f'Probe-score results — top k={k} (average / top-{n_str} / bottom-{n_str})\n'
+        f'Model: {data["model"]}\n'
+        f'Error bars are [2.5th, 97.5th] percentiles',
+        fontsize=18, pad=8,
+    )
 
     fig.tight_layout()
     if output_path:
@@ -919,9 +1007,13 @@ def _plot_probe_score_bars(data, k, output_path, ymin, ymax):
 
 
 def plot_probe_score_heatmaps(data, cmap='viridis', output_dir=None, vmin=None, vmax=None):
-    """Plot one bar chart per top-k value, showing all 6 category scores.
+    """Plot bar charts from a parsed probe-score data dict.
 
-    All plots share the same y-axis range so they are directly comparable.
+    Per top-k value generates:
+      - separate plots for average, top-N, and bottom-N (where available)
+      - a combined plot showing all three side by side (when top/bot data present)
+
+    All plots share the same y-axis range for direct comparison.
 
     Parameters
     ----------
@@ -930,7 +1022,13 @@ def plot_probe_score_heatmaps(data, cmap='viridis', output_dir=None, vmin=None, 
     output_dir : directory to save PNGs; display interactively if None
     vmin, vmax : y-axis bounds; default to slightly below/above global min/max
     """
-    all_vals = [v for entry in data['variants'].values() for v, _, _ in entry.values()]
+    all_vals = [
+        v
+        for entry_group in data['variants'].values()
+        for entry in entry_group.values()
+        if isinstance(entry, dict)
+        for v, _, _ in entry.values()
+    ]
     span = max(all_vals) - min(all_vals)
     if vmin is None:
         vmin = max(0.0, min(all_vals) - span * 0.1)
@@ -941,10 +1039,25 @@ def plot_probe_score_heatmaps(data, cmap='viridis', output_dir=None, vmin=None, 
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    has_split = any('top' in v or 'bot' in v for v in data['variants'].values())
+
     for k in data['ks']:
-        fname    = f'probe_score_k{k}.png'
-        out_path = str(out_dir / fname) if out_dir else None
-        _plot_probe_score_bars(data, k, out_path, vmin, vmax)
+        variant = data['variants'][k]
+        present = [w for w in ('avg', 'top', 'bot') if w in variant]
+
+        for which in present:
+            # avg keeps the original filename when no top/bot data exists
+            if which == 'avg' and not has_split:
+                fname = f'probe_score_k{k}.png'
+            else:
+                fname = f'probe_score_k{k}_{which}.png'
+            out_path = str(out_dir / fname) if out_dir else None
+            _plot_probe_score_bars(data, k, which, out_path, vmin, vmax)
+
+        if len(present) > 1:
+            fname    = f'probe_score_k{k}_combined.png'
+            out_path = str(out_dir / fname) if out_dir else None
+            _plot_probe_score_bars_combined(data, k, out_path, vmin, vmax)
 
 
 # ---------------------------------------------------------------------------
