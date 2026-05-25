@@ -1360,6 +1360,203 @@ def run_test_context(model_name, dataset_name, ks, alphas, num_tests=50, models_
             print(f"LoRA ({lora_adapter}) — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
 
 
+# ---------------------------------------------------------------------------
+# Context-Aware Decoding (CAD)
+# ---------------------------------------------------------------------------
+
+def cad_generate(model, tokenizer, prompt_with_context, prompt_without_context,
+                 max_new_tokens=100, alpha=1.0):
+    """Generate tokens with Context-Aware Decoding (Shi et al., 2023).
+
+    log p_CAD(y_t) = (1+alpha) * log p(y_t | ctx, q) - alpha * log p(y_t | q)
+
+    Both prompts must already include the chat template / generation prefix.
+    """
+    device = next(model.parameters()).device
+    enc_with = tokenizer(prompt_with_context, return_tensors="pt").to(device)
+    enc_without = tokenizer(prompt_without_context, return_tensors="pt").to(device)
+
+    new_token_ids = []
+    with ch.no_grad():
+        out_with = model(**enc_with, use_cache=True)
+        out_without = model(**enc_without, use_cache=True)
+
+        for step in range(max_new_tokens):
+            log_p_with = ch.nn.functional.log_softmax(out_with.logits[:, -1, :].float(), dim=-1)
+            log_p_without = ch.nn.functional.log_softmax(out_without.logits[:, -1, :].float(), dim=-1)
+            log_p_cad = (1.0 + alpha) * log_p_with - alpha * log_p_without
+
+            next_token = log_p_cad.argmax(dim=-1, keepdim=True)  # [1, 1]
+            next_id = next_token.item()
+            new_token_ids.append(next_id)
+            if next_id == tokenizer.eos_token_id:
+                break
+            if step < max_new_tokens - 1:
+                out_with = model(input_ids=next_token, past_key_values=out_with.past_key_values, use_cache=True)
+                out_without = model(input_ids=next_token, past_key_values=out_without.past_key_values, use_cache=True)
+
+    return tokenizer.decode(new_token_ids, skip_special_tokens=True)
+
+
+def run_test_context_cad(model_name, dataset_name, alphas, num_tests=50,
+                         quantize=True, dataset_path=None,
+                         judge_model_name="meta-llama/Meta-Llama-3-8B-Instruct",
+                         bootstrap_iters=1000, seed=42,
+                         output_dir=None, quantize_judge=None,
+                         hf_judge_info_model=None):
+    """Evaluate context-following with CAD decoding at multiple alpha values.
+
+    Loads the base model once, generates responses for all samples × alphas,
+    then judges everything in a single judge-model pass per axis.
+    """
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    def _results_path(label):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe = label.replace('/', '_').replace(' ', '_')
+        filename = f"results_context_{safe}_{ts}.jsonl"
+        return os.path.join(output_dir, filename) if output_dir else filename
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+
+    random.seed(seed)
+    _, dataset = get_dataset(dataset_name, num_tests, second_dict=True, dataset_path=dataset_path)
+    start = time.time()
+
+    # all_records[alpha] = list of record dicts for that alpha
+    all_records = {alpha: [] for alpha in alphas}
+    for idx, row in enumerate(dataset):
+        query_with = (
+            f"Here is some confirmed context information:\n{row['context']}\n"
+            f"Please answer the question based solely on the context above in one short sentence.\n"
+            f"Question: {row['query']}\n"
+        )
+        query_without = f"Question: {row['query']}\n"
+        prompt_with = tokenizer.apply_chat_template(
+            [{"role": "user", "content": query_with}], tokenize=False, add_generation_prompt=True
+        )
+        prompt_without = tokenizer.apply_chat_template(
+            [{"role": "user", "content": query_without}], tokenize=False, add_generation_prompt=True
+        )
+        for alpha in alphas:
+            response = cad_generate(model, tokenizer, prompt_with, prompt_without,
+                                    max_new_tokens=100, alpha=alpha)
+            answer_str = (
+                f"Context: {row['context']}\nQuestion: {row['query']}\n"
+                f"Generated Response: {response}\nContext-aligned Response: {row['corr_answer']}"
+            )
+            all_records[alpha].append({
+                "model": f"{model_name}_cad_alpha_{alpha}",
+                "dataset": dataset_name,
+                "sample_idx": idx,
+                "query": row['query'],
+                "context": row['context'],
+                "corr_answer": row['corr_answer'],
+                "prompt": query_with,
+                "response": response,
+                "cad_alpha": alpha,
+                "_answer_str": answer_str,
+            })
+        if (idx + 1) % 20 == 0:
+            print(f"  Generated {idx + 1}/{len(dataset)} samples ({time.time() - start:.0f}s)", flush=True)
+
+    model.to('cpu')
+    del model
+    gc.collect()
+    ch.cuda.empty_cache()
+
+    _qj = quantize_judge if quantize_judge is not None else quantize
+
+    # Context axis
+    judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
+    for alpha in alphas:
+        for record in all_records[alpha]:
+            record["judge_model_context"] = judge_model_name
+            task = _JUDGE_PROMPT_CONTEXT["A"].format(answer=record["_answer_str"])
+            jp = judge_tokenizer.apply_chat_template(
+                [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+            )
+            input_ids = judge_tokenizer(jp, return_tensors="pt").to('cuda')
+            with ch.no_grad():
+                output_ids = judge_model.generate(
+                    **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=judge_tokenizer.eos_token_id
+                )
+            raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
+            rationale, decision = _parse_judge_response(raw)
+            record["judge_prompt_context_A"] = task
+            record["judge_raw_context_A"] = raw
+            record["rationale_context_A"] = rationale
+            record["decision_context_A"] = decision
+    del judge_model
+    gc.collect()
+    ch.cuda.empty_cache()
+
+    # Informative axis
+    if hf_judge_info_model:
+        info_jmodel, info_jtok = get_truthfulqa_judge(hf_judge_info_model)
+        for alpha in alphas:
+            for record in all_records[alpha]:
+                decision = _hf_judge_logprob_decision(
+                    record["query"], record["response"], info_jmodel, info_jtok, "Helpful:"
+                )
+                record["judge_model_informative"] = hf_judge_info_model
+                record["judge_prompt_informative"] = f"Q: {record['query']}\nA: {record['response']}\nHelpful:"
+                record["judge_raw_informative"] = "yes" if decision else "no"
+                record["rationale_informative"] = ""
+                record["decision_informative"] = decision
+        info_jmodel.to('cpu')
+        del info_jmodel
+        gc.collect()
+        ch.cuda.empty_cache()
+    else:
+        judge_model, judge_tokenizer = get_model(judge_model_name, quantize=_qj)
+        for alpha in alphas:
+            for record in all_records[alpha]:
+                record["judge_model_informative"] = judge_model_name
+                task = _JUDGE_PROMPT_INFORMATIVE.format(answer=record["_answer_str"])
+                jp = judge_tokenizer.apply_chat_template(
+                    [{"role": "user", "content": task}], tokenize=False, add_generation_prompt=True
+                )
+                input_ids = judge_tokenizer(jp, return_tensors="pt").to('cuda')
+                with ch.no_grad():
+                    output_ids = judge_model.generate(
+                        **input_ids, max_new_tokens=200, do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=judge_tokenizer.eos_token_id
+                    )
+                raw = judge_tokenizer.decode(output_ids[0][input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
+                rationale, decision = _parse_judge_response(raw)
+                record["judge_prompt_informative"] = task
+                record["judge_raw_informative"] = raw
+                record["rationale_informative"] = rationale
+                record["decision_informative"] = decision
+        del judge_model
+        gc.collect()
+        ch.cuda.empty_cache()
+
+    # Save + report per alpha
+    for alpha in alphas:
+        records = all_records[alpha]
+        for record in records:
+            record.pop("_answer_str", None)
+        label = f"{model_name}_cad_alpha_{alpha}"
+        results_file = _results_path(label)
+        with open(results_file, 'w') as f:
+            for record in records:
+                f.write(json.dumps(record) + '\n')
+        print(f"Results saved to {results_file}")
+        decisions_context = [r["decision_context_A"] for r in records]
+        decisions_info = [r["decision_informative"] for r in records]
+        decisions_both = [a and b for a, b in zip(decisions_context, decisions_info)]
+        (ti, tilo, tihi) = bootstrap_ci(decisions_both, B=bootstrap_iters)
+        (t, tlo, thi) = bootstrap_ci(decisions_context, B=bootstrap_iters)
+        (i, ilo, ihi) = bootstrap_ci(decisions_info, B=bootstrap_iters)
+        print(f"CAD alpha={alpha} — context*informative: {ti:.3f} [{tilo:.3f}, {tihi:.3f}]  context: {t:.3f} [{tlo:.3f}, {thi:.3f}]  informative: {i:.3f} [{ilo:.3f}, {ihi:.3f}]")
+
+    print(f"CAD context test completed in {time.time() - start:.1f}s, dataset size {len(dataset)}")
+
+
 def run_rejudge(jsonl_files, judge_model_name, quantize=True, bootstrap_iters=1000):
     """Re-evaluate already-generated responses from JSONL files using a new judge model.
 
@@ -2239,6 +2436,111 @@ def run_probe_score_experiment(model_name, probes_path, accuracies_path,
         print(f"  → saved to {out_path}")
 
 
+def _cad_answer_score(model, tokenizer, query, context, response_ids):
+    """CAD score: mean per-token (log P(token|ctx,q) - log P(token|q)) over answer tokens."""
+    resp_len = response_ids.shape[1]
+
+    def _lps(prompt_str):
+        ids = tokenizer(prompt_str, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        full_ids = ch.cat([ids, response_ids.cpu()], dim=1).to('cuda')
+        with ch.no_grad():
+            logits = model(full_ids).logits
+        plen = ids.shape[1]
+        resp_logits = logits[0, plen - 1: plen - 1 + resp_len, :]
+        lp = ch.log_softmax(resp_logits, dim=-1)
+        return lp[ch.arange(resp_len), response_ids[0].cpu()].float().cpu().numpy()
+
+    prompt_ctx = tokenizer.apply_chat_template(
+        [{"role": "user", "content": (
+            f"Here is some confirmed context information:\n{context}\n"
+            f"Please answer the question based solely on the context above in one short sentence.\n"
+            f"Question: {query}\n"
+        )}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    prompt_no_ctx = tokenizer.apply_chat_template(
+        [{"role": "user", "content": (
+            f"Please answer the question in one short sentence.\n"
+            f"Question: {query}\n"
+        )}],
+        tokenize=False, add_generation_prompt=True,
+    )
+
+    lp_ctx = _lps(prompt_ctx)
+    lp_no_ctx = _lps(prompt_no_ctx)
+    return float((lp_ctx - lp_no_ctx).mean())
+
+
+def score_model_on_cad_dataset(model, tokenizer, instances):
+    results = []
+    for inst in instances:
+        if inst["subcategory"] == "no_context":
+            continue
+        response_ids = tokenizer(inst["answer"], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        score = _cad_answer_score(model, tokenizer, inst["question"], inst["context"], response_ids)
+        record = dict(inst)
+        record["mean_cad_score"] = score
+        results.append(record)
+    return results
+
+
+def run_cad_score_experiment(model_name, dataset_size=500, output_dir=None,
+                              quantize=True, dataset_path=None, seed=42,
+                              bootstrap_iters=1000, top_bottom_n=100):
+    dataset_path = dataset_path or "../PopQA/conflictQA-popQA-chatgpt.json"
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    instances = build_prob_experiment_dataset(dataset_path, dataset_size, seed=seed)
+    print(f"Built dataset: {len(instances)} instances ({dataset_size} entries × 6 categories)")
+
+    col_keys = [
+        ("true",  "matching"), ("true",  "non_matching"),
+        ("false", "matching"), ("false", "non_matching"),
+    ]
+
+    model, tokenizer = get_model(model_name, quantize=quantize)
+
+    t0 = time.time()
+    results = score_model_on_cad_dataset(model, tokenizer, instances)
+    elapsed = time.time() - t0
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    safe = model_name.replace('/', '_').replace(' ', '_')
+    filename = f"cad_score_experiment_{safe}_{ts}.jsonl"
+    out_path = os.path.join(output_dir, filename) if output_dir else filename
+    with open(out_path, 'w') as f:
+        for r in results:
+            f.write(json.dumps(r) + '\n')
+
+    groups = {}
+    for r in results:
+        groups.setdefault((r["category"], r["subcategory"]), []).append(r["mean_cad_score"])
+
+    parts = []
+    for cat, sub in col_keys:
+        mean, lo, hi = bootstrap_ci(groups[(cat, sub)], B=bootstrap_iters)
+        parts.append(f"{cat}/{sub}={mean:.3f} [{lo:.3f},{hi:.3f}]")
+    print(f"{model_name}  ({elapsed:.1f}s)")
+    print("  " + "  ".join(parts))
+
+    if top_bottom_n > 0:
+        top_parts, bot_parts = [], []
+        for cat, sub in col_keys:
+            scores = sorted(groups[(cat, sub)], reverse=True)
+            top_scores = scores[:top_bottom_n]
+            bot_scores = scores[-top_bottom_n:]
+            t_mean, t_lo, t_hi = bootstrap_ci(top_scores, B=bootstrap_iters)
+            b_mean, b_lo, b_hi = bootstrap_ci(bot_scores, B=bootstrap_iters)
+            top_parts.append(f"{cat}/{sub}={t_mean:.3f} [{t_lo:.3f},{t_hi:.3f}]")
+            bot_parts.append(f"{cat}/{sub}={b_mean:.3f} [{b_lo:.3f},{b_hi:.3f}]")
+        actual_n = min(top_bottom_n, min(len(v) for v in groups.values()))
+        print(f"  top-{actual_n}: " + "  ".join(top_parts))
+        print(f"  bot-{actual_n}: " + "  ".join(bot_parts))
+
+    print(f"  → saved to {out_path}")
+
+
 def _fit_linear(masks, scores):
     """Ridge regression: masks [M, S] → scores [M]. Returns (coef, intercept)."""
     from sklearn.linear_model import Ridge
@@ -2510,6 +2812,24 @@ def build_parser():
                    help="Path to a local HF model for informativeness judging (logprob-based, same as in test-truth). "
                         "The context axis always uses --judge-model.")
 
+    # --- test-context-cad ---
+    p = subparsers.add_parser("test-context-cad", help="Evaluate context-following with Context-Aware Decoding at multiple alphas.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset", **dataset_kwargs)
+    p.add_argument("--dataset-path", default=None, help="Override default dataset file path")
+    p.add_argument("--num-tests", type=int, default=50)
+    p.add_argument("--alphas", **alphas_kwargs)
+    p.add_argument("--judge-model", default="meta-llama/Meta-Llama-3-8B-Instruct", help="HuggingFace model ID for the LLM judge")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling (default: 42)")
+    p.add_argument("--output-dir", default=None, help="Directory to save results JSONL files (default: current directory)")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+    p.add_argument("--no-quantize-judge", action="store_true", dest="no_quantize_judge",
+                   help="Load the judge model in full precision regardless of --no-quantize")
+    p.add_argument("--hf-judge-info-model", default=None, metavar="PATH",
+                   help="Path to a local HF model for informativeness judging (logprob-based). "
+                        "The context axis always uses --judge-model.")
+
     # --- rejudge ---
     p = subparsers.add_parser("rejudge", help="Re-evaluate saved responses from JSONL files with a different judge.")
     p.add_argument("jsonl_files", nargs="+", metavar="JSONL", help="One or more results_context_*.jsonl files to re-judge")
@@ -2722,6 +3042,22 @@ def build_parser():
                    help="Report stats for top-N and bottom-N results per group (0 to disable)")
     p.add_argument("--no-quantize", **quantize_kwargs)
 
+    # --- cad-score-experiment ---
+    p = subparsers.add_parser("cad-score-experiment",
+                              help="Measure mean CAD score (log P(a|ctx,q) - log P(a|q)) across matching/non-matching categories.")
+    p.add_argument("--model", **model_kwargs)
+    p.add_argument("--dataset-path", default="../PopQA/conflictQA-popQA-chatgpt.json",
+                   help="Path to ConflictQA JSONL dataset")
+    p.add_argument("--dataset-size", type=int, default=500,
+                   help="Number of ConflictQA entries to sample")
+    p.add_argument("--output-dir", default=None, help="Directory to save result JSONL file")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dataset sampling")
+    p.add_argument("--bootstrap-iters", type=int, default=1000,
+                   help="Bootstrap iterations for 95%% confidence intervals")
+    p.add_argument("--top-bottom-n", type=int, default=100, dest="top_bottom_n",
+                   help="Report stats for top-N and bottom-N results per group (0 to disable)")
+    p.add_argument("--no-quantize", **quantize_kwargs)
+
     return parser
 
 
@@ -2751,6 +3087,15 @@ def main():
                          quantize_judge=quantize_judge,
                          hf_judge_info_model=args.hf_judge_info_model,
                          lora_adapter=args.lora_adapter)
+
+    elif args.mode == "test-context-cad":
+        quantize_judge = False if getattr(args, "no_quantize_judge", False) else None
+        run_test_context_cad(args.model, args.dataset, args.alphas, args.num_tests,
+                             quantize=quantize, dataset_path=args.dataset_path,
+                             judge_model_name=args.judge_model, bootstrap_iters=args.bootstrap_iters,
+                             seed=args.seed, output_dir=args.output_dir,
+                             quantize_judge=quantize_judge,
+                             hf_judge_info_model=args.hf_judge_info_model)
 
     elif args.mode == "rejudge":
         run_rejudge(args.jsonl_files, args.judge_model, quantize=quantize, bootstrap_iters=args.bootstrap_iters)
@@ -2856,6 +3201,18 @@ def main():
             accuracies_path=acc_path,
             dataset_size=args.dataset_size,
             top_ks=args.top_k,
+            output_dir=args.output_dir,
+            quantize=quantize,
+            dataset_path=args.dataset_path,
+            seed=args.seed,
+            bootstrap_iters=args.bootstrap_iters,
+            top_bottom_n=args.top_bottom_n,
+        )
+
+    elif args.mode == "cad-score-experiment":
+        run_cad_score_experiment(
+            model_name=args.model,
+            dataset_size=args.dataset_size,
             output_dir=args.output_dir,
             quantize=quantize,
             dataset_path=args.dataset_path,
